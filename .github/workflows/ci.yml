@@ -16,6 +16,7 @@ jobs:
         run: |
           shellcheck --severity=warning \
             bin/kali-rdp-setup bin/kali-rdp-doctor bin/kali-rdp-cleanup \
+            bin/kali-rdp-user bin/kali-rdp-profile bin/kali-ssh-setup \
             install.sh packaging/build-deb.sh lib/common.sh \
             packaging/debian/postinst packaging/debian/prerm packaging/debian/postrm
 
@@ -62,3 +63,7 @@ jobs:
           [ "$rc" -le 2 ] || { echo "doctor crashed (rc=$rc)"; exit 1; }
           sudo bash bin/kali-rdp-cleanup --dry-run
           sudo bash bin/kali-rdp-setup --dry-run --no-tmux --no-timer || true
+          # JSON output must stay parseable -- nothing may leak onto stdout.
+          bash bin/kali-rdp-doctor --json | python3 -c 'import json,sys; json.load(sys.stdin)'
+          echo "json ok"
+          KRK_SHARE=./share bash bin/kali-rdp-profile list

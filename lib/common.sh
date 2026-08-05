@@ -1,7 +1,8 @@
 # shellcheck shell=bash
 # Shared helpers for kali-rdp-kit. Sourced, never executed.
+# shellcheck disable=SC2034  # these are consumed by the scripts that source us
 
-KRK_VERSION="0.1.0"
+KRK_VERSION="0.2.0"
 KRK_XRDP_DIR="${KRK_XRDP_DIR:-/etc/xrdp}"
 KRK_STATE_DIR="${KRK_STATE_DIR:-/var/lib/kali-rdp-kit}"
 KRK_BACKUP_DIR="${KRK_BACKUP_DIR:-$KRK_STATE_DIR/backups}"
@@ -140,7 +141,7 @@ krk_xvnc_sessions() {
 # the client disconnects the socket closes but Xvnc lingers -- that is exactly
 # the orphan we want to reap, and why uptime is the wrong signal.
 krk_display_connected() {
-    local display=$1 port=$(( 5900 + $1 ))
+    local port=$(( 5900 + $1 ))
     if have ss; then
         ss -tnH state established "( sport = :$port or dport = :$port )" 2>/dev/null \
             | grep -q . && return 0
@@ -156,6 +157,13 @@ krk_proc_env() {
     [ -r "/proc/$pid/environ" ] || return 1
     tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null \
         | awk -F= -v v="$var" '$1==v {sub("^" v "=", ""); print; exit}'
+}
+
+# The Xorg backend is usable only when the xorgxrdp driver is installed. The
+# presence of the Xorg binary says nothing -- Kali ships Xorg but not
+# xorgxrdp, which is precisely the trap this kit exists to remove.
+krk_xorgxrdp_usable() {
+    dpkg-query -W -f='${Status}' xorgxrdp 2>/dev/null | grep -q "install ok installed"
 }
 
 krk_init_state() {

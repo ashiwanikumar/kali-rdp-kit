@@ -2,14 +2,14 @@
 #
 # kali-rdp-kit installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/ashvani/kali-rdp-kit/main/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/ashiwanikumar/kali-rdp-kit/main/install.sh | sudo bash
 #
 # Installs the tools and the cleanup timer. It does NOT reconfigure xrdp --
 # run `sudo kali-rdp-setup` for that, so the changes are yours to review.
 #
 set -euo pipefail
 
-REPO="${KRK_REPO:-ashvani/kali-rdp-kit}"
+REPO="${KRK_REPO:-ashiwanikumar/kali-rdp-kit}"
 REF="${KRK_REF:-main}"
 PKG="kali-rdp-kit"
 PREFIX="${PREFIX:-/usr}"

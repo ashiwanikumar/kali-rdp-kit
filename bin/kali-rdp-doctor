@@ -13,19 +13,86 @@ KRK_LIB="${KRK_LIB:-/usr/lib/kali-rdp-kit}"
 
 FAILURES=0
 WARNINGS=0
+PASSES=0
 SESMAN_INI="$KRK_XRDP_DIR/sesman.ini"
 XRDP_INI="$KRK_XRDP_DIR/xrdp.ini"
 
-pass()  { ok "$*"; }
-flag()  { warn "$*"; WARNINGS=$(( WARNINGS + 1 )); }
-fail()  { err "$*"; FAILURES=$(( FAILURES + 1 )); }
-fix()   { printf '%s       fix:%s %s\n' "$C_DIM" "$C_RESET" "$*"; }
+JSON=0
+WATCH=0
+WATCH_INTERVAL=5
+CURRENT_SECTION="general"
+RESULTS=()
 
-usage() { echo "Usage: kali-rdp-doctor [-h]"; }
-[ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] && { usage; exit 0; }
+usage() {
+    cat <<'EOF'
+Usage: kali-rdp-doctor [options]
 
-printf '%skali-rdp-doctor %s%s\n' "$C_BOLD" "$KRK_VERSION" "$C_RESET"
-[ "$(id -u)" -eq 0 ] || log "${C_DIM}(not root -- log and process checks will be partial)${C_RESET}"
+Read-only diagnostics for an xrdp setup. Changes nothing.
+
+Options:
+  -j, --json             emit machine-readable JSON instead of a report
+  -w, --watch [SECONDS]  re-run continuously (default interval: 5s)
+  -h, --help             this message
+
+Exit status: 0 all clear, 1 warnings, 2 failures.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        -j|--json)  JSON=1 ;;
+        -w|--watch) WATCH=1
+                    case ${2:-} in [0-9]*) WATCH_INTERVAL=$2; shift ;; esac ;;
+        -h|--help)  usage; exit 0 ;;
+        *)          err "unknown option: $1"; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+# --watch re-execs a plain run so there is exactly one code path producing the
+# report; the loop only handles the screen and the sleep.
+if [ "$WATCH" = 1 ]; then
+    trap 'printf "\033[?25h\n"; exit 0' INT TERM
+    printf '\033[?25l'
+    while :; do
+        out=$("$0" 2>&1); rc=$?
+        printf '\033[H\033[2J%s\n' "$out"
+        printf '%srefreshing every %ss -- Ctrl-C to stop (last exit: %s)%s\n' \
+            "$C_DIM" "$WATCH_INTERVAL" "$rc" "$C_RESET"
+        sleep "$WATCH_INTERVAL"
+    done
+fi
+
+# JSON mode must not interleave the human report into stdout.
+if [ "$JSON" = 1 ]; then
+    log()  { :; }
+    info() { :; }
+    step() { CURRENT_SECTION=$1; }
+    fix()  { :; }
+else
+    _step_orig() { printf '\n%s%s%s\n' "$C_BOLD" "$*" "$C_RESET"; }
+    step() { CURRENT_SECTION=$1; _step_orig "$@"; }
+    fix()  { printf '%s       fix:%s %s\n' "$C_DIM" "$C_RESET" "$*"; }
+fi
+
+json_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' \
+        -e 's/\t/\\t/g' -e "s/$(printf '\r')/\\\\r/g" | tr -d '\000-\010\013\014\016-\037'
+}
+
+record() {
+    local status=$1 msg=$2
+    RESULTS+=("$status|$CURRENT_SECTION|$msg")
+}
+
+pass()  { record pass "$*"; PASSES=$(( PASSES + 1 ));   [ "$JSON" = 1 ] || ok "$*"; }
+flag()  { record warn "$*"; WARNINGS=$(( WARNINGS + 1 )); [ "$JSON" = 1 ] || warn "$*"; }
+fail()  { record fail "$*"; FAILURES=$(( FAILURES + 1 )); [ "$JSON" = 1 ] || err "$*"; }
+
+if [ "$JSON" = 0 ]; then
+    printf '%skali-rdp-doctor %s%s\n' "$C_BOLD" "$KRK_VERSION" "$C_RESET"
+    [ "$(id -u)" -eq 0 ] || log "${C_DIM}(not root -- log and process checks will be partial)${C_RESET}"
+fi
 
 # --- 1. packages ------------------------------------------------------------
 
@@ -125,8 +192,8 @@ if [ -f "$XRDP_INI" ]; then
         fix "run: sudo kali-rdp-setup"
     fi
 
-    if grep -qE '^\[Xorg\]' "$XRDP_INI" && ! have Xorg; then
-        flag "[Xorg] session type offered but Xorg backend is unusable here"
+    if grep -qE '^\[Xorg\]' "$XRDP_INI" && ! krk_xorgxrdp_usable; then
+        flag "[Xorg] session type offered but xorgxrdp is missing -- it will hang"
         fix "run: sudo kali-rdp-setup   # comments out the Xorg entry"
     fi
 else
@@ -261,8 +328,14 @@ for f in /var/log/xrdp-sesman.log /var/log/xrdp.log; do
     [ -r "$f" ] || continue
     hits=$(grep -iE '\[ERROR\]|\[WARN\]' "$f" 2>/dev/null | tail -5)
     if [ -n "$hits" ]; then
-        log "  ${C_DIM}$f${C_RESET}"
-        printf '%s\n' "$hits" | sed 's/^/    /'
+        # In JSON mode nothing but the document may reach stdout, so record the
+        # count as a check instead of dumping the excerpt.
+        if [ "$JSON" = 1 ]; then
+            flag "$(printf '%s' "$hits" | wc -l) recent error/warning line(s) in $f"
+        else
+            log "  ${C_DIM}$f${C_RESET}"
+            printf '%s\n' "$hits" | sed 's/^/    /'
+        fi
         log_hits=1
     fi
 done
@@ -270,12 +343,52 @@ done
 
 # --- summary ----------------------------------------------------------------
 
-echo
-if [ "$FAILURES" -gt 0 ]; then
-    printf '%s%d failure(s), %d warning(s)%s\n' "$C_RED" "$FAILURES" "$WARNINGS" "$C_RESET"
-    exit 2
-elif [ "$WARNINGS" -gt 0 ]; then
-    printf '%s%d warning(s), no failures%s\n' "$C_YEL" "$WARNINGS" "$C_RESET"
-    exit 1
+if [ "$FAILURES" -gt 0 ]; then    overall=fail
+elif [ "$WARNINGS" -gt 0 ]; then  overall=warn
+else                              overall=pass
 fi
-printf '%sall checks passed%s\n' "$C_GRN" "$C_RESET"
+
+if [ "$JSON" = 1 ]; then
+    # Session inventory is the part a monitoring system actually graphs, so
+    # emit it as structured data rather than leaving it in the check messages.
+    printf '{\n'
+    printf '  "version": "%s",\n' "$KRK_VERSION"
+    printf '  "status": "%s",\n' "$overall"
+    printf '  "counts": {"pass": %d, "warn": %d, "fail": %d},\n' \
+        "$PASSES" "$WARNINGS" "$FAILURES"
+    printf '  "sessions": ['
+    sep=""
+    while read -r spid sdisp; do
+        [ -n "${spid:-}" ] || continue
+        conn=false; krk_display_connected "$sdisp" && conn=true
+        scpu=$(ps -o %cpu= -p "$spid" 2>/dev/null | tr -d ' ')
+        setime=$(ps -o etimes= -p "$spid" 2>/dev/null | tr -d ' ')
+        printf '%s\n    {"display": %s, "pid": %s, "connected": %s, "cpu_percent": %s, "uptime_seconds": %s}' \
+            "$sep" "$sdisp" "$spid" "$conn" "${scpu:-0}" "${setime:-0}"
+        sep=","
+    done <<<"$(krk_xvnc_sessions)"
+    [ -n "$sep" ] && printf '\n  '
+    printf '],\n'
+    printf '  "checks": [\n'
+    sep=""
+    for r in "${RESULTS[@]}"; do
+        st=${r%%|*}; rest=${r#*|}; sec=${rest%%|*}; msg=${rest#*|}
+        printf '%s    {"status": "%s", "section": "%s", "message": "%s"}' \
+            "$sep" "$st" "$(json_escape "$sec")" "$(json_escape "$msg")"
+        sep=$',\n'
+    done
+    printf '\n  ]\n}\n'
+else
+    echo
+    case $overall in
+        fail) printf '%s%d failure(s), %d warning(s)%s\n' "$C_RED" "$FAILURES" "$WARNINGS" "$C_RESET" ;;
+        warn) printf '%s%d warning(s), no failures%s\n' "$C_YEL" "$WARNINGS" "$C_RESET" ;;
+        pass) printf '%sall checks passed%s\n' "$C_GRN" "$C_RESET" ;;
+    esac
+fi
+
+case $overall in
+    fail) exit 2 ;;
+    warn) exit 1 ;;
+esac
+exit 0

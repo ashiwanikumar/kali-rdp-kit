@@ -1,13 +1,18 @@
 [Unit]
 Description=Periodic reap of orphaned xrdp session processes
-Documentation=https://github.com/ashvani/kali-rdp-kit
+Documentation=https://github.com/ashiwanikumar/kali-rdp-kit
 
 [Timer]
 # Every 10 minutes. The grace period in kali-rdp-cleanup (default 30 min) is
 # what actually decides when something dies, so polling often is cheap and
 # only makes the decision more accurate.
-OnBootSec=5min
-OnUnitActiveSec=10min
+#
+# A calendar schedule rather than OnBootSec+OnUnitActiveSec: that monotonic
+# pair leaves the timer with NextElapseUSecMonotonic=infinity once the boot
+# offset has passed, i.e. it fires once and then never again. Persistent= is
+# also only meaningful for calendar timers, and here it makes the run catch up
+# after the machine has been suspended or off.
+OnCalendar=*:0/10
 AccuracySec=1min
 Persistent=true
 

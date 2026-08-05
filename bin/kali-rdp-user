@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+#
+# kali-rdp-user -- provision users for RDP access.
+#
+# Creates the account, puts it in the groups xrdp actually needs, gives it a
+# desktop profile, and (optionally) a home-directory quota of sessions.
+#
+set -uo pipefail
+
+KRK_LIB="${KRK_LIB:-/usr/lib/kali-rdp-kit}"
+KRK_SHARE="${KRK_SHARE:-/usr/share/kali-rdp-kit}"
+# shellcheck source=../lib/common.sh
+. "$KRK_LIB/common.sh" || { echo "cannot load $KRK_LIB/common.sh" >&2; exit 1; }
+
+KRK_DRY_RUN=0
+PROFILE="openbox"
+SHELL_PATH=""
+NO_SUDO=1
+SSH_KEY=""
+
+usage() {
+    cat <<'EOF'
+Usage: sudo kali-rdp-user <command> [options]
+
+Commands:
+  add NAME       create an RDP-capable user
+  list           list users who can currently log in over RDP
+  remove NAME    remove the user (prompts before deleting the home directory)
+
+Options for `add`:
+  -p, --profile NAME   desktop profile (default: openbox; see kali-rdp-profile list)
+      --shell PATH     login shell (default: the system default)
+      --sudo           also add the user to the sudo group
+      --ssh-key FILE   install FILE as the user's authorized_keys
+  -n, --dry-run        print what would change, change nothing
+  -h, --help           this message
+
+Examples:
+  sudo kali-rdp-user add alice
+  sudo kali-rdp-user add bob --profile xfce --sudo
+  sudo kali-rdp-user list
+EOF
+}
+
+# xrdp's sesman consults TerminalServerUsers from sesman.ini when
+# AlwaysGroupCheck is true. Honour whatever the admin configured rather than
+# assuming the default group name.
+rdp_group() {
+    local g; g=$(ini_get "$KRK_XRDP_DIR/sesman.ini" Security TerminalServerUsers)
+    printf '%s' "${g:-tsusers}"
+}
+group_check_enforced() {
+    local v; v=$(ini_get "$KRK_XRDP_DIR/sesman.ini" Security AlwaysGroupCheck)
+    [ "$v" = "true" ] || [ "$v" = "1" ]
+}
+
+cmd_add() {
+    local name=$1
+    require_root
+    krk_init_state
+
+    case $name in
+        ''|*[!a-z0-9_-]*) die "invalid username: $name (use lowercase, digits, - and _)" ;;
+    esac
+
+    local group; group=$(rdp_group)
+
+    if id "$name" >/dev/null 2>&1; then
+        ok "user $name already exists"
+    else
+        info "creating user $name"
+        local args="--create-home --shell ${SHELL_PATH:-/usr/bin/zsh}"
+        [ -x "${SHELL_PATH:-/usr/bin/zsh}" ] || args="--create-home --shell /bin/bash"
+        # shellcheck disable=SC2086
+        run useradd $args "$name" || die "useradd failed"
+        if [ "$KRK_DRY_RUN" != 1 ]; then
+            warn "no password set for $name -- set one now (RDP needs it):"
+            passwd "$name" || warn "passwd failed; run 'passwd $name' before they log in"
+        fi
+    fi
+
+    # Create the RDP group if sesman is configured to enforce it.
+    if ! getent group "$group" >/dev/null 2>&1; then
+        if group_check_enforced; then
+            info "creating group $group (sesman enforces AlwaysGroupCheck)"
+            run groupadd "$group"
+        fi
+    fi
+    if getent group "$group" >/dev/null 2>&1; then
+        if id -nG "$name" 2>/dev/null | tr ' ' '\n' | grep -qx "$group"; then
+            ok "$name already in $group"
+        else
+            run usermod -aG "$group" "$name"
+            info "added $name to $group"
+        fi
+    else
+        ok "sesman does not enforce a terminal-server group; skipping"
+    fi
+
+    if [ "$NO_SUDO" = 0 ]; then
+        run usermod -aG sudo "$name"
+        info "added $name to sudo"
+    fi
+
+    local home; home=$(getent passwd "$name" | cut -d: -f6)
+
+    if [ -n "$SSH_KEY" ]; then
+        [ -f "$SSH_KEY" ] || die "no such key file: $SSH_KEY"
+        info "installing authorized_keys for $name"
+        run install -d -o "$name" -g "$name" -m 0700 "$home/.ssh"
+        run install -o "$name" -g "$name" -m 0600 "$SSH_KEY" "$home/.ssh/authorized_keys"
+    fi
+
+    # tmux config, so a dropped RDP session does not cost them their terminals.
+    if [ -f "$KRK_SHARE/tmux.conf" ] && [ ! -f "$home/.tmux.conf" ]; then
+        run install -o "$name" -g "$name" -m 0644 "$KRK_SHARE/tmux.conf" "$home/.tmux.conf"
+    fi
+
+    info "applying desktop profile: $PROFILE"
+    if have kali-rdp-profile; then
+        local pf_args="set $PROFILE --user $name"
+        [ "$KRK_DRY_RUN" = 1 ] && pf_args="$pf_args --dry-run"
+        # shellcheck disable=SC2086
+        kali-rdp-profile $pf_args || warn "profile setup failed; run it manually"
+    else
+        warn "kali-rdp-profile not found; skipping desktop setup"
+    fi
+
+    echo
+    info "$name is ready for RDP"
+    log "  connect to port $(ini_get "$KRK_XRDP_DIR/xrdp.ini" Globals port) as $name"
+}
+
+cmd_list() {
+    local group; group=$(rdp_group)
+    local enforced="no"; group_check_enforced && enforced="yes"
+
+    printf '%sRDP-capable users%s  ' "$C_BOLD" "$C_RESET"
+    printf '%s(group check: %s, group: %s)%s\n\n' "$C_DIM" "$enforced" "$group" "$C_RESET"
+
+    local members="" u shell home xs
+    if [ "$enforced" = "yes" ] && getent group "$group" >/dev/null 2>&1; then
+        members=$(getent group "$group" | cut -d: -f4 | tr ',' ' ')
+        [ -n "$members" ] || { log "  no users in $group -- nobody can log in over RDP"; return 0; }
+    else
+        # Without a group check, any account with a real shell and a home can
+        # start a session. UID >= 1000 filters out system accounts.
+        members=$(awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' /etc/passwd)
+    fi
+
+    printf '  %-14s %-22s %s\n' "USER" "SHELL" "SESSION"
+    for u in $members; do
+        id "$u" >/dev/null 2>&1 || continue
+        shell=$(getent passwd "$u" | cut -d: -f7)
+        home=$(getent passwd "$u" | cut -d: -f6)
+        xs="(system default)"
+        [ -f "$home/.xsession" ] && xs=$(grep -vE '^\s*#|^\s*$' "$home/.xsession" | head -1)
+        case $shell in
+            */nologin|*/false) continue ;;
+        esac
+        printf '  %-14s %-22s %s\n' "$u" "$shell" "$xs"
+    done
+}
+
+cmd_remove() {
+    local name=$1
+    require_root
+    id "$name" >/dev/null 2>&1 || die "no such user: $name"
+    [ "$name" = "root" ] && die "refusing to remove root"
+    [ "$name" = "${SUDO_USER:-}" ] && die "refusing to remove the invoking user ($name)"
+
+    local home; home=$(getent passwd "$name" | cut -d: -f6)
+
+    # Kill their sessions first, or userdel refuses and half-removes the account.
+    local pid
+    for pid in $(pgrep -u "$name" 2>/dev/null); do
+        run kill -TERM "$pid" 2>/dev/null
+    done
+
+    if [ "$KRK_DRY_RUN" = 1 ]; then
+        printf '%s  would remove%s user %s (home %s kept)\n' "$C_DIM" "$C_RESET" "$name" "$home"
+        return 0
+    fi
+
+    run userdel "$name" || die "userdel failed"
+    ok "removed user $name"
+    if [ -d "$home" ]; then
+        warn "home directory left in place: $home"
+        warn "delete it yourself if you are sure: sudo rm -rf $home"
+    fi
+}
+
+[ $# -gt 0 ] || { usage; exit 2; }
+CMD=$1; shift
+POSITIONAL=""
+while [ $# -gt 0 ]; do
+    case $1 in
+        -p|--profile) PROFILE=${2:?--profile needs a value}; shift ;;
+        --shell)      SHELL_PATH=${2:?--shell needs a value}; shift ;;
+        --sudo)       NO_SUDO=0 ;;
+        --ssh-key)    SSH_KEY=${2:?--ssh-key needs a value}; shift ;;
+        -n|--dry-run) KRK_DRY_RUN=1 ;;
+        -h|--help)    usage; exit 0 ;;
+        -*)           err "unknown option: $1"; usage >&2; exit 2 ;;
+        *)            POSITIONAL="$POSITIONAL $1" ;;
+    esac
+    shift
+done
+export KRK_DRY_RUN
+# shellcheck disable=SC2086
+set -- $POSITIONAL
+
+case $CMD in
+    add)    [ $# -ge 1 ] || die "add needs a username"; cmd_add "$1" ;;
+    list)   cmd_list ;;
+    remove) [ $# -ge 1 ] || die "remove needs a username"; cmd_remove "$1" ;;
+    -h|--help) usage ;;
+    *)      err "unknown command: $CMD"; usage >&2; exit 2 ;;
+esac

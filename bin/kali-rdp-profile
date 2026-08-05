@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+#
+# kali-rdp-profile -- pick the desktop an RDP session starts.
+#
+# Writes ~/.xsession for the target user and applies the per-profile
+# workarounds that make that desktop behave over a VNC transport.
+#
+set -uo pipefail
+
+KRK_LIB="${KRK_LIB:-/usr/lib/kali-rdp-kit}"
+KRK_SHARE="${KRK_SHARE:-/usr/share/kali-rdp-kit}"
+# shellcheck source=../lib/common.sh
+. "$KRK_LIB/common.sh" || { echo "cannot load $KRK_LIB/common.sh" >&2; exit 1; }
+
+PROFILE_DIR="${KRK_PROFILE_DIR:-$KRK_SHARE/profiles}"
+KRK_DRY_RUN=0
+TARGET_USER=""
+
+usage() {
+    cat <<'EOF'
+Usage: kali-rdp-profile <command> [options]
+
+Commands:
+  list                 show available desktop profiles
+  show [--user USER]   show the profile a user's session currently starts
+  set NAME [--user U]  install NAME's packages and make it the session (root)
+
+Options:
+  -u, --user USER      operate on USER (default: the invoking user)
+  -n, --dry-run        print what would change, change nothing
+  -h, --help           this message
+
+Examples:
+  kali-rdp-profile list
+  sudo kali-rdp-profile set openbox
+  sudo kali-rdp-profile set xfce --user alice
+EOF
+}
+
+profile_path() { printf '%s/%s.profile' "$PROFILE_DIR" "$1"; }
+
+load_profile() {
+    local p; p=$(profile_path "$1")
+    [ -f "$p" ] || die "unknown profile: $1 (try: kali-rdp-profile list)"
+    PROFILE_DESC=; PROFILE_PACKAGES=; PROFILE_SESSION=; PROFILE_STATUS=
+    unset -f profile_tweak 2>/dev/null
+    # shellcheck disable=SC1090
+    . "$p"
+    [ -n "$PROFILE_SESSION" ] || die "profile $1 defines no PROFILE_SESSION"
+}
+
+status_badge() {
+    case $1 in
+        recommended) printf '%srecommended%s' "$C_GRN" "$C_RESET" ;;
+        known-issue) printf '%sknown issue%s' "$C_YEL" "$C_RESET" ;;
+        heavy)       printf '%sheavy%s' "$C_YEL" "$C_RESET" ;;
+        *)           printf '%s' "$1" ;;
+    esac
+}
+
+cmd_list() {
+    [ -d "$PROFILE_DIR" ] || die "no profile directory: $PROFILE_DIR"
+    printf '%sAvailable desktop profiles%s\n\n' "$C_BOLD" "$C_RESET"
+    local p name installed
+    for p in "$PROFILE_DIR"/*.profile; do
+        [ -f "$p" ] || continue
+        name=$(basename "$p" .profile)
+        load_profile "$name"
+        installed=""
+        have "${PROFILE_SESSION%% *}" && installed="${C_DIM}(installed)${C_RESET}"
+        printf '  %s%-9s%s  %s  %s\n' "$C_BOLD" "$name" "$C_RESET" \
+            "$(status_badge "$PROFILE_STATUS")" "$installed"
+        printf '%s\n' "$PROFILE_DESC" | fold -s -w 68 | sed 's/^/               /'
+        echo
+    done
+    printf '  %sset one with:%s sudo kali-rdp-profile set <name>\n' "$C_DIM" "$C_RESET"
+}
+
+cmd_show() {
+    local user=${TARGET_USER:-${SUDO_USER:-$(id -un)}} home xs
+    home=$(getent passwd "$user" | cut -d: -f6) || die "no such user: $user"
+    [ -n "$home" ] || die "no such user: $user"
+    xs="$home/.xsession"
+    if [ ! -f "$xs" ]; then
+        log "$user: no ~/.xsession -- the system default session will be used"
+        log "  ${C_DIM}set one with: sudo kali-rdp-profile set <name> --user $user${C_RESET}"
+        return 0
+    fi
+    local cur; cur=$(grep -vE '^\s*#|^\s*$' "$xs" | head -1)
+    log "$user: $xs starts ${C_BOLD}${cur}${C_RESET}"
+    local p name
+    for p in "$PROFILE_DIR"/*.profile; do
+        [ -f "$p" ] || continue
+        name=$(basename "$p" .profile)
+        load_profile "$name"
+        if [ "$PROFILE_SESSION" = "$cur" ]; then
+            log "  matches profile: ${C_BOLD}$name${C_RESET} ($(status_badge "$PROFILE_STATUS"))"
+            return 0
+        fi
+    done
+    log "  ${C_DIM}(not a kali-rdp-kit profile)${C_RESET}"
+}
+
+cmd_set() {
+    local name=$1
+    require_root
+    krk_init_state
+    load_profile "$name"
+
+    local user=${TARGET_USER:-${SUDO_USER:-root}} home
+    home=$(getent passwd "$user" | cut -d: -f6)
+    [ -n "$home" ] || die "no such user: $user"
+    [ -d "$home" ] || die "$user has no home directory at $home"
+
+    info "setting $user's session to $name ($PROFILE_SESSION)"
+    [ "$PROFILE_STATUS" = "known-issue" ] && \
+        warn "$name has a known session-stability issue; see docs/xfce-25s.md"
+
+    # Only install what is missing, so re-running is cheap.
+    local missing="" pkg
+    for pkg in $PROFILE_PACKAGES; do
+        dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" \
+            || missing="$missing $pkg"
+    done
+    if [ -n "$missing" ]; then
+        info "installing:$missing"
+        run env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+        # shellcheck disable=SC2086
+        run env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $missing \
+            || die "package installation failed"
+    else
+        ok "all packages for $name already installed"
+    fi
+
+    local xs="$home/.xsession"
+    if [ -f "$xs" ] && [ "$(grep -vE '^\s*#|^\s*$' "$xs" | head -1)" = "$PROFILE_SESSION" ]; then
+        ok "$xs already starts $PROFILE_SESSION"
+    elif [ "$KRK_DRY_RUN" = 1 ]; then
+        printf '%s  would write%s %s -> %s\n' "$C_DIM" "$C_RESET" "$xs" "$PROFILE_SESSION"
+    else
+        backup_file "$xs"
+        cat >"$xs" <<EOF
+#!/bin/sh
+# Managed by kali-rdp-kit (profile: $name).
+# Change with: sudo kali-rdp-profile set <name> --user $user
+exec $PROFILE_SESSION
+EOF
+        chown "$user:$(id -gn "$user")" "$xs"
+        chmod 0755 "$xs"
+        ok "wrote $xs"
+    fi
+
+    if declare -F profile_tweak >/dev/null; then
+        info "applying $name workarounds"
+        profile_tweak "$home" "$user"
+    fi
+
+    echo
+    info "done -- reconnect your RDP session for this to take effect"
+}
+
+[ $# -gt 0 ] || { usage; exit 2; }
+CMD=$1; shift
+POSITIONAL=""
+while [ $# -gt 0 ]; do
+    case $1 in
+        -u|--user)   TARGET_USER=${2:?--user needs a value}; shift ;;
+        -n|--dry-run) KRK_DRY_RUN=1 ;;
+        -h|--help)   usage; exit 0 ;;
+        -*)          err "unknown option: $1"; usage >&2; exit 2 ;;
+        *)           POSITIONAL="$POSITIONAL $1" ;;
+    esac
+    shift
+done
+export KRK_DRY_RUN
+# shellcheck disable=SC2086
+set -- $POSITIONAL
+
+case $CMD in
+    list)  cmd_list ;;
+    show)  cmd_show ;;
+    set)   [ $# -ge 1 ] || die "set needs a profile name (try: kali-rdp-profile list)"
+           cmd_set "$1" ;;
+    -h|--help) usage ;;
+    *)     err "unknown command: $CMD"; usage >&2; exit 2 ;;
+esac

@@ -1,6 +1,7 @@
 # kali-rdp-kit
 
-Reliable headless RDP on Kali Linux — setup, diagnostics, and orphan cleanup.
+Reliable headless RDP and SSH on Kali Linux — setup, diagnostics, desktop
+profiles, user provisioning, and orphan cleanup.
 
 Kali ships `xrdp` but not `xorgxrdp`, the driver xrdp's default Xorg backend
 needs. The result is a setup that looks installed, accepts your password, and
@@ -12,7 +13,7 @@ their sessions.
 This packages those fixes.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ashvani/kali-rdp-kit/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/ashiwanikumar/kali-rdp-kit/main/install.sh | sudo bash
 sudo kali-rdp-setup --dry-run   # review
 sudo kali-rdp-setup             # apply
 kali-rdp-doctor                 # verify
@@ -21,7 +22,19 @@ kali-rdp-doctor                 # verify
 Installing changes nothing about your xrdp configuration. `kali-rdp-setup` is a
 separate, explicit step, and `--dry-run` prints every change first.
 
-## The three tools
+## The tools
+
+| Command | What it does |
+|---|---|
+| `kali-rdp-setup` | Idempotent xrdp configuration |
+| `kali-rdp-doctor` | Read-only diagnostics (`--json`, `--watch`) |
+| `kali-rdp-cleanup` | Reaps orphaned session processes |
+| `kali-rdp-profile` | Chooses and tunes the desktop a session starts |
+| `kali-rdp-user` | Provisions users for RDP access |
+| `kali-ssh-setup` | SSH keepalives, session persistence, hardening |
+
+Every one of them takes `--dry-run`.
+
 
 ### `kali-rdp-setup` — idempotent configuration
 
@@ -70,6 +83,76 @@ sudo kali-rdp-cleanup [-n|--dry-run] [-g|--grace SECONDS] [-v|--verbose]
 ```
 
 `--dry-run` is worth running first; it prints exactly what would die.
+
+### `kali-rdp-profile` — desktop profiles
+
+Picks what an RDP session starts, and applies the workarounds that make that
+desktop usable over a VNC transport (compositing off, screen locking off —
+a lock screen inside RDP is a lockout risk, not a security gain).
+
+```bash
+kali-rdp-profile list                    # openbox, i3, xfce, kde
+sudo kali-rdp-profile set openbox
+sudo kali-rdp-profile set xfce --user alice
+kali-rdp-profile show
+```
+
+`openbox` and `i3` are marked recommended: neither runs a session manager with
+a startup sequence that can time out. `xfce` is marked known-issue — see below.
+
+### `kali-rdp-user` — provisioning
+
+```bash
+sudo kali-rdp-user add alice --profile openbox
+sudo kali-rdp-user add bob --profile xfce --sudo --ssh-key ~/bob.pub
+kali-rdp-user list
+```
+
+Creates the account, adds it to the terminal-server group *if* your `sesman.ini`
+actually enforces one (it reads `AlwaysGroupCheck` and `TerminalServerUsers`
+rather than assuming), installs the tmux config, and applies a desktop profile.
+
+### `kali-ssh-setup` — connection survival
+
+```bash
+sudo kali-ssh-setup                # keepalives, mosh, tmux auto-attach, fail2ban
+sudo kali-ssh-setup --harden       # + disable password auth and root login
+```
+
+Writes a drop-in to `/etc/ssh/sshd_config.d/` and never edits `sshd_config`.
+Validates with `sshd -t` before the config can take effect, and **reloads rather
+than restarts**, so the session you are running it from is not dropped.
+
+`--harden` is refused unless an authorized key already exists for you or root —
+the check exists specifically to stop you locking yourself out of a remote box.
+
+The tmux auto-attach snippet is guarded on `$-` containing `i` and on
+`SSH_CONNECTION` being set, so `scp`, `rsync`, `sftp`, and `ssh host cmd` are
+unaffected. Set `KRK_NO_AUTOTMUX=1` to bypass it for one login.
+
+### Monitoring
+
+```bash
+kali-rdp-doctor --watch        # live refreshing view
+kali-rdp-doctor --watch 30     # every 30s
+kali-rdp-doctor --json         # machine-readable
+```
+
+`--json` emits a session inventory alongside the checks:
+
+```json
+{
+  "status": "warn",
+  "counts": {"pass": 14, "warn": 3, "fail": 0},
+  "sessions": [
+    {"display": 18, "pid": 2503788, "connected": true,
+     "cpu_percent": 4.8, "uptime_seconds": 3475}
+  ],
+  "checks": [ ... ]
+}
+```
+
+Exit status is `0`/`1`/`2`, so it drops straight into a monitoring check.
 
 ## What it fixes, and why
 

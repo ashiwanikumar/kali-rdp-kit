@@ -139,7 +139,7 @@ ok "[Xvnc] session type present"
 
 # Comment out the Xorg entry so the login dropdown cannot offer a backend that
 # will hang. Leave the section body intact so --keep-dm users can restore it.
-if grep -qE '^\[Xorg\]' "$XRDP_INI" && ! have Xorg; then
+if grep -qE '^\[Xorg\]' "$XRDP_INI" && ! krk_xorgxrdp_usable; then
     info "disabling the unusable [Xorg] session type"
     if [ "$KRK_DRY_RUN" = 1 ]; then
         printf '%s  would comment out%s [Xorg] in xrdp.ini\n' "$C_DIM" "$C_RESET"

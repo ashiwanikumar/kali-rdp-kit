@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+#
+# kali-ssh-setup -- make SSH survive flaky links, and optionally harden it.
+#
+# Safety rules this script follows, because a mistake here locks you out of a
+# remote box:
+#   * writes a drop-in under /etc/ssh/sshd_config.d/, never edits sshd_config
+#   * validates with `sshd -t` before the drop-in is allowed to take effect
+#   * reloads instead of restarting, so live connections are not dropped
+#   * refuses to disable password auth unless an authorized key already exists
+#
+set -uo pipefail
+
+KRK_LIB="${KRK_LIB:-/usr/lib/kali-rdp-kit}"
+KRK_SHARE="${KRK_SHARE:-/usr/share/kali-rdp-kit}"
+# shellcheck source=../lib/common.sh
+. "$KRK_LIB/common.sh" || { echo "cannot load $KRK_LIB/common.sh" >&2; exit 1; }
+
+KRK_DRY_RUN=0
+HARDEN=0
+NO_MOSH=0
+NO_AUTOTMUX=0
+NO_FAIL2BAN=0
+CHANGED=0
+
+DROPIN_DIR=/etc/ssh/sshd_config.d
+DROPIN="$DROPIN_DIR/60-kali-rdp-kit.conf"
+
+usage() {
+    cat <<'EOF'
+Usage: sudo kali-ssh-setup [options]
+
+Make SSH sessions survive dropped links, and keep work alive across
+disconnects.
+
+By default this only adds keepalives, installs mosh, and sets up tmux
+auto-attach. Hardening (disabling password auth and root login) is opt-in via
+--harden, and is refused unless you already have an authorized key.
+
+Options:
+  -n, --dry-run       print what would change, change nothing
+      --harden        also disable password auth and root login (needs a key)
+      --no-mosh       skip installing mosh
+      --no-autotmux   skip the tmux auto-attach shell snippet
+      --no-fail2ban   skip installing/enabling fail2ban
+  -h, --help          this message
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        -n|--dry-run)   KRK_DRY_RUN=1 ;;
+        --harden)       HARDEN=1 ;;
+        --no-mosh)      NO_MOSH=1 ;;
+        --no-autotmux)  NO_AUTOTMUX=1 ;;
+        --no-fail2ban)  NO_FAIL2BAN=1 ;;
+        -h|--help)      usage; exit 0 ;;
+        *)              err "unknown option: $1"; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+export KRK_DRY_RUN
+
+require_root
+krk_init_state
+
+target_user=${SUDO_USER:-root}
+target_home=$(getent passwd "$target_user" | cut -d: -f6)
+note_change() { CHANGED=$(( CHANGED + 1 )); }
+
+printf '%skali-ssh-setup %s%s\n' "$C_BOLD" "$KRK_VERSION" "$C_RESET"
+[ "$KRK_DRY_RUN" = 1 ] && info "dry run -- no changes will be made"
+
+# --- 1. packages ------------------------------------------------------------
+
+step "1. Packages"
+
+missing=""
+have tmux || missing="$missing tmux"
+[ "$NO_MOSH" = 0 ] && ! have mosh-server && missing="$missing mosh"
+[ "$NO_FAIL2BAN" = 0 ] && ! have fail2ban-server && missing="$missing fail2ban"
+
+if [ -n "$missing" ]; then
+    info "installing:$missing"
+    run env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    # shellcheck disable=SC2086
+    run env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $missing \
+        || warn "some packages failed to install; continuing"
+    note_change
+else
+    ok "all requested packages present"
+fi
+
+# --- 2. sshd keepalives -----------------------------------------------------
+
+step "2. sshd connection survival"
+
+if [ ! -d "$DROPIN_DIR" ]; then
+    warn "$DROPIN_DIR does not exist; this sshd may not support drop-ins"
+    warn "refusing to edit /etc/ssh/sshd_config directly -- skipping sshd changes"
+else
+    if ! grep -qE '^\s*Include\s+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config 2>/dev/null; then
+        warn "sshd_config has no Include for sshd_config.d; the drop-in would be ignored"
+        warn "add this as the FIRST line of /etc/ssh/sshd_config, then re-run:"
+        warn "  Include /etc/ssh/sshd_config.d/*.conf"
+    else
+        # ClientAliveInterval makes the *server* probe the client, so a session
+        # behind a NAT that silently drops idle flows is detected and, more
+        # importantly, kept alive rather than left half-open.
+        new_dropin=$(cat <<EOF
+# Managed by kali-rdp-kit. Re-run 'kali-ssh-setup' to regenerate.
+# Remove this file and reload sshd to revert.
+
+# Probe the client every 30s; give up after 6 missed probes (3 minutes).
+# Keeps sessions alive across brief link outages instead of half-open.
+ClientAliveInterval 30
+ClientAliveCountMax 6
+TCPKeepAlive yes
+
+# A slow client should not hold a pre-auth slot open indefinitely.
+LoginGraceTime 30
+MaxAuthTries 4
+EOF
+)
+        if [ "$HARDEN" = 1 ]; then
+            # Refusing to lock the admin out is the whole point of this check.
+            key_found=0
+            for u in "$target_user" root; do
+                h=$(getent passwd "$u" | cut -d: -f6)
+                [ -n "$h" ] && [ -s "$h/.ssh/authorized_keys" ] && key_found=1
+            done
+            if [ "$key_found" = 0 ]; then
+                err "--harden refused: no authorized_keys found for $target_user or root"
+                err "add a key first, or you will be locked out:"
+                err "  ssh-copy-id $target_user@<this-host>"
+                exit 1
+            fi
+            ok "authorized key present; hardening is safe"
+            new_dropin="$new_dropin
+
+# Hardening (--harden). A key is present for $target_user or root.
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin prohibit-password
+"
+        fi
+
+        if [ -f "$DROPIN" ] && [ "$(cat "$DROPIN")" = "$new_dropin" ]; then
+            ok "sshd drop-in already current"
+        elif [ "$KRK_DRY_RUN" = 1 ]; then
+            printf '%s  would write%s %s:\n' "$C_DIM" "$C_RESET" "$DROPIN"
+            printf '%s\n' "$new_dropin" | sed 's/^/      /'
+        else
+            backup_file "$DROPIN"
+            # Stage, validate, and only then move into place. sshd -t reads the
+            # real config tree, so the candidate has to be staged there -- keep
+            # the window as small as possible and always restore on failure.
+            staged="$DROPIN_DIR/.60-kali-rdp-kit.candidate"
+            printf '%s\n' "$new_dropin" >"$staged"
+            saved=""
+            [ -f "$DROPIN" ] && { saved=$(mktemp); cp -a "$DROPIN" "$saved"; }
+            mv "$staged" "$DROPIN"
+            if sshd -t 2>/tmp/krk-sshd-test.$$; then
+                ok "sshd config validates"
+                info "wrote $DROPIN"
+                note_change
+            else
+                err "sshd -t rejected the new config; reverting"
+                sed 's/^/      /' /tmp/krk-sshd-test.$$ >&2
+                if [ -n "$saved" ]; then cp -a "$saved" "$DROPIN"; else rm -f "$DROPIN"; fi
+                rm -f "$saved" /tmp/krk-sshd-test.$$
+                exit 1
+            fi
+            rm -f "$saved" /tmp/krk-sshd-test.$$
+        fi
+    fi
+fi
+
+# --- 3. tmux auto-attach ----------------------------------------------------
+
+step "3. Session persistence"
+
+if [ "$NO_AUTOTMUX" = 1 ]; then
+    warn "--no-autotmux given; skipping"
+else
+    snippet_marker="# >>> kali-rdp-kit tmux auto-attach >>>"
+    # The guards matter more than the attach itself: without them this breaks
+    # scp, rsync, sftp, and `ssh host cmd`, all of which run non-interactively.
+    snippet=$(cat <<'EOF'
+# >>> kali-rdp-kit tmux auto-attach >>>
+# Attach to (or create) a persistent tmux session on interactive SSH logins, so
+# a dropped connection never loses running work. Guarded so that non-interactive
+# sessions -- scp, rsync, sftp, `ssh host cmd` -- are left completely alone.
+if [ -z "${TMUX:-}" ] && [ -n "${SSH_CONNECTION:-}" ] && [ -z "${KRK_NO_AUTOTMUX:-}" ]; then
+    case $- in
+        *i*)
+            if command -v tmux >/dev/null 2>&1; then
+                tmux new-session -A -s main
+            fi
+            ;;
+    esac
+fi
+# <<< kali-rdp-kit tmux auto-attach <<<
+EOF
+)
+    for rc in "$target_home/.bashrc" "$target_home/.zshrc"; do
+        [ -f "$rc" ] || continue
+        if grep -qF "$snippet_marker" "$rc"; then
+            ok "$(basename "$rc") already has the auto-attach snippet"
+        elif [ "$KRK_DRY_RUN" = 1 ]; then
+            printf '%s  would append%s auto-attach snippet to %s\n' "$C_DIM" "$C_RESET" "$rc"
+        else
+            backup_file "$rc"
+            printf '\n%s\n' "$snippet" >>"$rc"
+            info "appended auto-attach snippet to $rc"
+            note_change
+        fi
+    done
+    log "  ${C_DIM}set KRK_NO_AUTOTMUX=1 to bypass it for one login${C_RESET}"
+fi
+
+# --- 4. fail2ban ------------------------------------------------------------
+
+step "4. Brute-force protection"
+
+if [ "$NO_FAIL2BAN" = 1 ]; then
+    warn "--no-fail2ban given; skipping"
+elif ! have fail2ban-server; then
+    warn "fail2ban not installed; skipping"
+else
+    jail=/etc/fail2ban/jail.d/kali-rdp-kit.conf
+    # xrdp is a password-facing service on a port scanners find quickly; it
+    # deserves the same treatment as sshd.
+    jail_body=$(cat <<EOF
+# Managed by kali-rdp-kit.
+[sshd]
+enabled  = true
+maxretry = 5
+bantime  = 1h
+findtime = 10m
+
+[xrdp-sesman]
+enabled  = true
+maxretry = 5
+bantime  = 1h
+findtime = 10m
+EOF
+)
+    if [ -f "$jail" ] && [ "$(cat "$jail")" = "$jail_body" ]; then
+        ok "fail2ban jail already current"
+    elif [ "$KRK_DRY_RUN" = 1 ]; then
+        printf '%s  would write%s %s\n' "$C_DIM" "$C_RESET" "$jail"
+    else
+        backup_file "$jail"
+        mkdir -p "$(dirname "$jail")"
+        printf '%s\n' "$jail_body" >"$jail"
+        info "wrote $jail"
+        note_change
+    fi
+    if ! systemctl is-enabled fail2ban >/dev/null 2>&1; then
+        run systemctl enable --now fail2ban
+        note_change
+    else
+        ok "fail2ban enabled"
+        [ "$CHANGED" -gt 0 ] && run systemctl reload fail2ban 2>/dev/null
+    fi
+fi
+
+# --- 5. apply ---------------------------------------------------------------
+
+step "5. Apply"
+
+if [ "$CHANGED" -eq 0 ]; then
+    ok "nothing changed; sshd not reloaded"
+elif [ "$KRK_DRY_RUN" = 1 ]; then
+    info "would reload sshd (reload, not restart -- live sessions survive)"
+else
+    if sshd -t 2>/dev/null; then
+        run systemctl reload ssh 2>/dev/null || run systemctl reload sshd 2>/dev/null
+        ok "sshd reloaded; your current session was not interrupted"
+    else
+        err "sshd -t failed; NOT reloading. Fix the config before disconnecting."
+        exit 1
+    fi
+fi
+
+echo
+if [ "$KRK_DRY_RUN" = 1 ]; then
+    info "dry run complete -- $CHANGED change(s) would have been made"
+else
+    info "done -- $CHANGED change(s) made"
+    if [ "$HARDEN" = 1 ]; then
+        warn "password auth is now disabled -- keep this session open and verify"
+        warn "a new login works before you disconnect."
+    fi
+fi
