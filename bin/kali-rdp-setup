@@ -16,7 +16,7 @@ KRK_DRY_RUN=0
 KEEP_DM=0
 NO_TMUX=0
 NO_TIMER=0
-DISCONNECT_LIMIT=1800
+REAP_DISCONNECTED=""
 RDP_PORT=""
 CHANGED=0
 
@@ -27,15 +27,19 @@ Usage: sudo kali-rdp-setup [options]
 Configure xrdp on Kali for reliable headless RDP:
   * disable the display manager that fights RDP for the console session
   * force the Xvnc backend (Kali has no xorgxrdp package)
-  * make sesman reap disconnected sessions
-  * install a cleanup timer for orphaned session processes
+  * keep disconnected desktops alive, so closing a client never closes apps
+  * install a cleanup timer for orphaned helper processes
   * drop in a tmux config that stops multi-client redraw corruption
+
+Desktops are persistent by default: disconnecting an RDP client leaves your
+applications running, and reconnecting returns you to them.
 
 Options:
   -n, --dry-run            print what would change, change nothing
       --keep-dm            leave lightdm/gdm3/sddm alone (console GUI needed)
       --port PORT          set the xrdp listening port (default: leave as-is)
-      --disconnect-limit S seconds before a disconnected session is killed (1800)
+      --reap-disconnected S close desktops left disconnected for S seconds.
+                           Off by default -- this CLOSES USERS' APPLICATIONS.
       --no-tmux            skip the tmux config
       --no-timer           skip the cleanup systemd timer
   -h, --help               this message
@@ -47,7 +51,10 @@ while [ $# -gt 0 ]; do
         -n|--dry-run)        KRK_DRY_RUN=1 ;;
         --keep-dm)           KEEP_DM=1 ;;
         --port)              RDP_PORT=${2:?--port needs a value}; shift ;;
-        --disconnect-limit)  DISCONNECT_LIMIT=${2:?--disconnect-limit needs a value}; shift ;;
+        --reap-disconnected) REAP_DISCONNECTED=${2:?--reap-disconnected needs a value}; shift
+                             case $REAP_DISCONNECTED in
+                                 ''|*[!0-9]*) die "--reap-disconnected needs a number of seconds" ;;
+                             esac ;;
         --no-tmux)           NO_TMUX=1 ;;
         --no-timer)          NO_TIMER=1 ;;
         -h|--help)           usage; exit 0 ;;
@@ -202,16 +209,29 @@ step "4. Disconnected session policy"
 
 [ -f "$SESMAN_INI" ] || die "$SESMAN_INI missing"
 
-if ini_set "$SESMAN_INI" Sessions KillDisconnected true; then
-    info "KillDisconnected=true"; note_change
+# Persistent by default: closing an RDP client must never close the user's
+# applications. sesman ignores these keys on the Xvnc backend anyway, but they
+# are set explicitly so behaviour does not silently change the day xorgxrdp
+# appears in the archive.
+if [ -z "$REAP_DISCONNECTED" ]; then
+    if ini_set "$SESMAN_INI" Sessions KillDisconnected false; then
+        info "KillDisconnected=false -- disconnected desktops are kept"; note_change
+    else
+        ok "KillDisconnected already false (desktops persist)"
+    fi
+    ok "disconnected desktops persist indefinitely; applications keep running"
 else
-    ok "KillDisconnected already true"
-fi
-
-if ini_set "$SESMAN_INI" Sessions DisconnectedTimeLimit "$DISCONNECT_LIMIT"; then
-    info "DisconnectedTimeLimit=$DISCONNECT_LIMIT"; note_change
-else
-    ok "DisconnectedTimeLimit already $DISCONNECT_LIMIT"
+    if ini_set "$SESMAN_INI" Sessions KillDisconnected true; then
+        info "KillDisconnected=true"; note_change
+    else
+        ok "KillDisconnected already true"
+    fi
+    if ini_set "$SESMAN_INI" Sessions DisconnectedTimeLimit "$REAP_DISCONNECTED"; then
+        info "DisconnectedTimeLimit=$REAP_DISCONNECTED"; note_change
+    else
+        ok "DisconnectedTimeLimit already $REAP_DISCONNECTED"
+    fi
+    warn "desktops disconnected longer than ${REAP_DISCONNECTED}s will be closed"
 fi
 
 # --- 5. cleanup timer -------------------------------------------------------
@@ -232,6 +252,29 @@ elif [ -f /usr/lib/systemd/system/kali-rdp-cleanup.timer ] \
 else
     warn "cleanup timer unit not installed (running from a git checkout?)"
     warn "install the package, or copy share/systemd/*.{service,timer} to /etc/systemd/system"
+fi
+
+# Keep the reaper's idea of the policy identical to sesman's, or the two
+# disagree about whether a parked desktop is garbage.
+if [ -n "$REAP_DISCONNECTED" ] && [ "$NO_TIMER" != 1 ]; then
+    override_dir=/etc/systemd/system/kali-rdp-cleanup.service.d
+    run mkdir -p "$override_dir"
+    if [ "$KRK_DRY_RUN" = 1 ]; then
+        printf '%s  would set%s KRK_GRACE_SECONDS=%s for kali-rdp-cleanup\n' \
+            "$C_DIM" "$C_RESET" "$REAP_DISCONNECTED"
+    else
+        printf '[Service]\nEnvironment=KRK_GRACE_SECONDS=%s\n' "$REAP_DISCONNECTED" \
+            >"$override_dir/grace.conf"
+        run systemctl daemon-reload
+        info "cleanup will reap desktops disconnected over ${REAP_DISCONNECTED}s"
+        note_change
+    fi
+elif [ -f /etc/systemd/system/kali-rdp-cleanup.service.d/grace.conf ]; then
+    # Returning to the default must actually undo the opt-in.
+    info "removing previous reap-disconnected override (desktops now persist)"
+    run rm -f /etc/systemd/system/kali-rdp-cleanup.service.d/grace.conf
+    run systemctl daemon-reload
+    note_change
 fi
 
 # A user crontab calling the old cleanup script will fight this timer.

@@ -45,13 +45,13 @@ Safe to re-run; every file it touches is backed up to
 |---|---|
 | Display manager | Disables `lightdm`/`gdm3`/`sddm` and switches the default target to `multi-user`. A console session on `:0` shares the user's D-Bus session bus, `ICEauthority`, and agent sockets with RDP sessions; both fight over them. Keep it with `--keep-dm`. |
 | Backend | Verifies the `[Xvnc]` session type and comments out `[Xorg]`, so the login dropdown cannot offer a backend that will hang. |
-| Session policy | Sets `KillDisconnected=true` and `DisconnectedTimeLimit` in `sesman.ini` — correct for the day xorgxrdp lands, but **inert on Xvnc** (see below). |
+| Session policy | Sets `KillDisconnected=false`: disconnecting never closes your apps. Inert on Xvnc anyway, but set explicitly so behaviour cannot change the day xorgxrdp appears. |
 | Cleanup | Enables the `kali-rdp-cleanup.timer`. |
 | tmux | Installs a config that stops multi-client redraw corruption. Never overwrites an existing `~/.tmux.conf`. |
 
 ```
 sudo kali-rdp-setup [-n|--dry-run] [--keep-dm] [--port PORT]
-                    [--disconnect-limit SECONDS] [--no-tmux] [--no-timer]
+                    [--reap-disconnected SECONDS] [--no-tmux] [--no-timer]
 ```
 
 ### `kali-rdp-doctor` — read-only diagnostics
@@ -69,29 +69,29 @@ When an RDP client is closed without logging out, `Xvnc`, `xrdp-chansrv`, and
 xrdp's pipewire module keep running. Reconnecting creates a *new* session
 alongside the old one, and they contend for the same sockets.
 
-**This reaps by disconnected-ness, not uptime.** xrdp proxies each client into
-Xvnc's loopback port (`5900 + display`), so an ESTABLISHED connection there
-means someone is actually looking at the session. A session with no client is
-recorded on first sighting and killed only if still unattached after a grace
-period (default 30 min).
+**Desktops are never closed. Only dead helpers are reaped.** Closing an RDP
+client is a disconnect, not a logout: your applications keep running, and
+reconnecting returns you to the same windows, days later if you like.
 
-That distinction matters. The obvious implementation — kill anything older than
-N hours — kills the session you are working in the moment it crosses N hours.
+What *is* reaped is unambiguous garbage — a `xrdp-chansrv` or pipewire module
+whose X server is already gone. Those hold VNC ports and make the next session
+fail to bind (`g_tcp_bind ... errno=98`), which is the actual cause of "xrdp
+worked yesterday and today it won't connect".
 
 ```
-sudo kali-rdp-cleanup [-n|--dry-run] [-g|--grace SECONDS] [-v|--verbose]
+sudo kali-rdp-cleanup [-n|--dry-run] [-g|--grace SECONDS|never] [-v|--verbose]
 ```
 
-`--dry-run` is worth running first; it prints exactly what would die.
-
-**Your apps stay open when you disconnect** — closing an RDP client is not a
-logout. The desktop and everything in it keeps running, and reconnecting puts
-you back in it. The grace period is how long a *disconnected* session is kept
-before it is reaped; raise it if you want desktops to park for days:
+On a shared box you may want idle desktops reclaimed. That is opt-in, because
+it closes users' applications:
 
 ```bash
-sudo systemctl edit kali-rdp-cleanup.service   # Environment=KRK_GRACE_SECONDS=86400
+sudo kali-rdp-setup --reap-disconnected 86400   # close after a day disconnected
 ```
+
+Even then the decision keys on whether a client is attached, never on uptime.
+The obvious implementation — kill anything older than N hours — kills the
+session you are working in the moment it crosses N hours.
 
 See [docs/session-persistence.md](docs/session-persistence.md) for the full
 picture, including why reconnecting sometimes hands you an empty desktop while

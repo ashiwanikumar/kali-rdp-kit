@@ -2,10 +2,15 @@
 #
 # kali-rdp-cleanup -- reap orphaned xrdp session processes.
 #
-# Reaps by *disconnected-ness*, not uptime. A session with no RDP client
-# attached is recorded on first sighting and killed only if it is still
-# unattached after a grace period, so a long-lived session you are actively
-# using is never touched.
+# Desktops are PERSISTENT by default: disconnecting an RDP client never closes
+# your applications, and a disconnected desktop is kept indefinitely so you can
+# reconnect to it hours or days later. Only true garbage is reaped -- helper
+# processes whose X server is already dead, which hold ports and cause the next
+# session to fail to bind.
+#
+# Opting in to reaping idle desktops (--grace SECONDS) keys the decision on
+# whether a client is attached, never on uptime, so a session you are actively
+# using is never a candidate.
 #
 set -uo pipefail
 
@@ -13,7 +18,7 @@ KRK_LIB="${KRK_LIB:-/usr/lib/kali-rdp-kit}"
 # shellcheck source=../lib/common.sh
 . "$KRK_LIB/common.sh" || { echo "cannot load $KRK_LIB/common.sh" >&2; exit 1; }
 
-GRACE_SECONDS=${KRK_GRACE_SECONDS:-1800}
+GRACE_SECONDS=${KRK_GRACE_SECONDS:-never}
 KRK_DRY_RUN=0
 VERBOSE=0
 SEEN_FILE=""
@@ -22,12 +27,17 @@ usage() {
     cat <<'EOF'
 Usage: kali-rdp-cleanup [options]
 
-Reap orphaned Xvnc / xrdp-chansrv / pipewire-xrdp processes left behind by
-RDP clients that disconnected without logging out.
+Reap orphaned xrdp helper processes (xrdp-chansrv, pipewire-xrdp) whose X
+server is already gone. These hold VNC ports and make the next session fail to
+bind, so they are always reaped.
+
+Desktops themselves are PERSISTENT by default: closing an RDP client does not
+close your applications, and a disconnected desktop is kept indefinitely.
 
 Options:
   -n, --dry-run          report what would be killed, change nothing
-  -g, --grace SECONDS    unattached time before reaping (default: 1800)
+  -g, --grace SECONDS    also reap desktops left disconnected this long.
+                         "never" (the default) keeps them indefinitely.
   -v, --verbose          also report sessions that were left alone
   -h, --help             this message
 
@@ -46,6 +56,14 @@ while [ $# -gt 0 ]; do
     shift
 done
 export KRK_DRY_RUN
+
+# "never" and 0 both mean persistent desktops. Anything else must be a positive
+# integer -- a typo here would silently start killing people's sessions.
+case $GRACE_SECONDS in
+    never|Never|NEVER|0|"") REAP_SESSIONS=0 ;;
+    *[!0-9]*) die "--grace must be a number of seconds or \"never\" (got: $GRACE_SECONDS)" ;;
+    *) REAP_SESSIONS=1 ;;
+esac
 
 krk_init_state
 
@@ -114,6 +132,15 @@ while read -r pid display; do
         live_displays="$live_displays $display"
         seen_clear "$display"
         [ "$VERBOSE" = 1 ] && ok ":$display -- client attached, leaving alone"
+        continue
+    fi
+
+    # Persistent mode: a disconnected desktop is somebody's parked work, not
+    # garbage. Keep it, and keep its helpers, so reconnecting finds the same
+    # windows. Only helpers whose X server is actually gone get reaped below.
+    if [ "$REAP_SESSIONS" = 0 ]; then
+        live_displays="$live_displays $display"
+        ok ":$display -- disconnected, keeping (applications stay running)"
         continue
     fi
 

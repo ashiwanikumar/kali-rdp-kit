@@ -4,30 +4,41 @@
 your window manager, and every application you opened keep running on the
 server. Reconnect and you land back in the same desktop with the same windows.
 
-Only two things end a session and close your apps:
-
-1. **Logging out** from inside the desktop (or `reboot`/`shutdown`).
-2. **Something reaping it** — which on Kali means `kali-rdp-cleanup`, and
-   nothing else. See below.
-
 ## How long do they stay open?
 
-By default, **30 minutes after you disconnect**, `kali-rdp-cleanup` reaps the
-session and your apps die with it. Change it with `--grace`, or by editing
-`KRK_GRACE_SECONDS` in the service unit:
+**Indefinitely.** Desktops are persistent by default: disconnect on Friday,
+reconnect on Monday, and your windows are where you left them. Nothing in this
+toolkit closes a desktop you have not logged out of.
+
+Only two things close your apps:
+
+1. **Logging out** from inside the desktop (or `reboot`/`shutdown`).
+2. **Opting in to reaping** — off by default, see below.
+
+Orphaned *helpers* (chansrv, pipewire) are still reaped immediately. Those are
+unambiguous garbage: a helper whose X server is already gone, holding a VNC
+port that makes the next session fail to bind with `errno=98`. Reaping them
+never touches a running desktop.
+
+### Opting in to closing idle desktops
+
+On a shared box, parked desktops cost RAM and you may want them reclaimed:
 
 ```bash
-sudo systemctl edit kali-rdp-cleanup.service
+sudo kali-rdp-setup --reap-disconnected 86400    # close after a day idle
 ```
 
-```ini
-[Service]
-Environment=KRK_GRACE_SECONDS=86400     # keep parked sessions for a day
-```
+This is a deliberate opt-in because **it closes users' applications**. Even
+then it keys on whether a client is attached, never on uptime, so a desktop
+somebody is actively using is never a candidate. Undo it by re-running plain
+`sudo kali-rdp-setup`.
 
-Set it very high and disconnected sessions effectively persist forever. The
-orphaned *helpers* (chansrv, pipewire) are still reaped immediately, because
-those are unambiguous garbage — a helper whose X server is already gone.
+### The cost of persistence
+
+Nothing closes desktops, so a client that keeps starting *new* sessions instead
+of rejoining will accumulate them until the machine runs out of memory. The
+usual cause is the colour-depth rule described below. `kali-rdp-doctor` warns
+once three or more parked desktops exist.
 
 ## The part that surprises people
 
@@ -85,13 +96,13 @@ Adding `D` or `I` to `Policy` makes this much worse — `I` means reconnecting
 from a different network gives you a new desktop every time. `kali-rdp-doctor`
 warns if either is set.
 
-## What survives even when the session is reaped
+## What survives if a desktop does end
 
 Killing the X server does not kill everything the user owns. Debian and Kali
 ship `KillUserProcesses=no` in `logind.conf`, and `kali-rdp-cleanup` only
 signals the session's own processes.
 
-| | Survives a reaped session? |
+| | Survives the desktop ending? |
 |---|---|
 | GUI applications | **No** — they lose the X connection and exit |
 | `tmux` / `screen` sessions | **Yes** — the server is not an X client |
@@ -111,7 +122,7 @@ up again from SSH without RDP at all.
 |---|---|
 | Close the RDP client window | Yes |
 | Network drops | Yes |
-| Reconnect within the grace period | Yes — same desktop, same windows |
+| Reconnect days later | Yes — same desktop, same windows |
 | Reconnect with a different colour depth | Old session survives, but you get a new desktop |
-| Disconnected longer than the grace period | No — reaped |
+| Disconnected a long time | Yes — unless you opted in to `--reap-disconnected` |
 | Log out from the desktop menu | No |

@@ -255,13 +255,24 @@ if [ -f "$SESMAN_INI" ]; then
         fi
     else
         log "  ${C_DIM}note${C_RESET}  KillDisconnected=${kd:-unset} / DisconnectedTimeLimit=${dt:-unset}"
-        log "        ${C_DIM}are set but INERT: sesman only honours them for xorgxrdp${C_RESET}"
-        log "        ${C_DIM}sessions, and this host uses Xvnc. Session reaping here${C_RESET}"
-        log "        ${C_DIM}is done entirely by kali-rdp-cleanup.${C_RESET}"
-        if systemctl is-enabled kali-rdp-cleanup.timer >/dev/null 2>&1; then
-            pass "kali-rdp-cleanup is enabled, so disconnected sessions are reaped"
-        else
-            fail "nothing is reaping disconnected sessions on this host"
+        log "        ${C_DIM}are INERT here: sesman only honours them for xorgxrdp${C_RESET}"
+        log "        ${C_DIM}sessions, and this host uses Xvnc. kali-rdp-cleanup${C_RESET}"
+        log "        ${C_DIM}owns this policy instead.${C_RESET}"
+
+        # Persistence is the default and the intended behaviour, so report the
+        # effective policy rather than grading it. The only real fault is the
+        # reaper being configured to close desktops without the admin knowing.
+        grace=$(systemctl show kali-rdp-cleanup.service -p Environment 2>/dev/null \
+                | sed -n 's/.*KRK_GRACE_SECONDS=\([^ ]*\).*/\1/p')
+        case ${grace:-never} in
+            never|0)
+                pass "desktops are persistent -- disconnecting never closes applications" ;;
+            *)
+                flag "desktops disconnected over ${grace}s are CLOSED, losing open applications"
+                fix "sudo rm /etc/systemd/system/kali-rdp-cleanup.service.d/grace.conf" ;;
+        esac
+        if ! systemctl is-enabled kali-rdp-cleanup.timer >/dev/null 2>&1; then
+            flag "cleanup timer disabled -- dead helper processes will accumulate"
             fix "sudo systemctl enable --now kali-rdp-cleanup.timer"
         fi
     fi
@@ -300,6 +311,7 @@ fi
 step "6. Live sessions"
 
 sessions=$(krk_xvnc_sessions)
+parked=0
 if [ -z "$sessions" ]; then
     log "  no Xvnc sessions running"
 else
@@ -312,14 +324,25 @@ else
             pass ":$display  pid $pid  up $et  cpu ${cpu}%  -- client attached"
             live_displays="$live_displays $display"
         else
-            flag ":$display  pid $pid  up $et  cpu ${cpu}%  -- NO client attached"
-            fix "sudo kali-rdp-cleanup --dry-run    # to preview reaping it"
+            # Not a fault: a parked desktop is somebody's work waiting to be
+            # reconnected to, and keeping it is the whole point of the default.
+            pass ":$display  pid $pid  up $et  cpu ${cpu}%  -- parked, applications still running"
+            parked=$(( parked + 1 ))
         fi
         # Runaway CPU on an X server is the classic orphan signature.
         if [ -n "$cpu" ] && [ "${cpu%%.*}" -ge 80 ] 2>/dev/null; then
             fail ":$display is burning ${cpu}% CPU -- likely a spinning orphan"
         fi
     done <<<"$sessions"
+
+    # The honest cost of persistent desktops: nothing closes them, so a client
+    # that keeps starting new sessions instead of rejoining will accumulate
+    # them until the box runs out of memory.
+    if [ "$parked" -ge 3 ]; then
+        flag "$parked parked desktops for this host -- each holds its own RAM"
+        fix "reconnect with the same colour depth to rejoin one instead of adding another"
+        fix "close the ones you do not need by logging out inside them"
+    fi
 fi
 
 step "7. Orphaned helper processes"
