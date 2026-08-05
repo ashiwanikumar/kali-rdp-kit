@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: Lint
+        run: |
+          shellcheck --severity=warning \
+            bin/kali-rdp-setup bin/kali-rdp-doctor bin/kali-rdp-cleanup \
+            install.sh packaging/build-deb.sh lib/common.sh \
+            packaging/debian/postinst packaging/debian/prerm packaging/debian/postrm
+
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n
+        run: |
+          for f in bin/* install.sh packaging/build-deb.sh lib/common.sh; do
+            bash -n "$f" && echo "ok  $f"
+          done
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fakeroot lintian
+      - name: Build .deb
+        run: ./packaging/build-deb.sh
+      - name: Verify contents
+        run: |
+          deb=$(ls dist/*.deb)
+          dpkg-deb --contents "$deb"
+          # The scripts are useless without the library they source.
+          dpkg-deb --contents "$deb" | grep -q 'usr/lib/kali-rdp-kit/common.sh'
+          dpkg-deb --contents "$deb" | grep -q 'usr/bin/kali-rdp-doctor'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kali-rdp-kit-deb
+          path: dist/*.deb
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools run without a live xrdp
+        run: |
+          sudo install -d /usr/lib/kali-rdp-kit
+          sudo install -m 0644 lib/common.sh /usr/lib/kali-rdp-kit/
+          # doctor exits 1/2 on an unconfigured box; only a crash is a failure.
+          bash bin/kali-rdp-doctor; rc=$?
+          [ "$rc" -le 2 ] || { echo "doctor crashed (rc=$rc)"; exit 1; }
+          sudo bash bin/kali-rdp-cleanup --dry-run
+          sudo bash bin/kali-rdp-setup --dry-run --no-tmux --no-timer || true

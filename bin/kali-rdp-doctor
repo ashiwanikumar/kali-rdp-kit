@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+#
+# kali-rdp-doctor -- diagnose a Kali xrdp setup and say what is wrong.
+#
+# Read-only. Never changes anything. Exit status: 0 all clear, 1 warnings,
+# 2 failures.
+#
+set -uo pipefail
+
+KRK_LIB="${KRK_LIB:-/usr/lib/kali-rdp-kit}"
+# shellcheck source=../lib/common.sh
+. "$KRK_LIB/common.sh" || { echo "cannot load $KRK_LIB/common.sh" >&2; exit 1; }
+
+FAILURES=0
+WARNINGS=0
+SESMAN_INI="$KRK_XRDP_DIR/sesman.ini"
+XRDP_INI="$KRK_XRDP_DIR/xrdp.ini"
+
+pass()  { ok "$*"; }
+flag()  { warn "$*"; WARNINGS=$(( WARNINGS + 1 )); }
+fail()  { err "$*"; FAILURES=$(( FAILURES + 1 )); }
+fix()   { printf '%s       fix:%s %s\n' "$C_DIM" "$C_RESET" "$*"; }
+
+usage() { echo "Usage: kali-rdp-doctor [-h]"; }
+[ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] && { usage; exit 0; }
+
+printf '%skali-rdp-doctor %s%s\n' "$C_BOLD" "$KRK_VERSION" "$C_RESET"
+[ "$(id -u)" -eq 0 ] || log "${C_DIM}(not root -- log and process checks will be partial)${C_RESET}"
+
+# --- 1. packages ------------------------------------------------------------
+
+step "1. Packages"
+
+if have xrdp || dpkg -s xrdp >/dev/null 2>&1; then
+    pass "xrdp installed ($(dpkg-query -W -f='${Version}' xrdp 2>/dev/null || echo unknown))"
+else
+    fail "xrdp is not installed"
+    fix "sudo apt install xrdp"
+fi
+
+if dpkg-query -W -f='${Status}' tigervnc-standalone-server 2>/dev/null | grep -q "install ok"; then
+    pass "tigervnc-standalone-server installed (provides Xvnc)"
+elif have Xvnc; then
+    pass "Xvnc available"
+else
+    fail "no Xvnc backend -- the Xvnc session type cannot start"
+    fix "sudo apt install tigervnc-standalone-server"
+fi
+
+# The Xorg backend needs xorgxrdp, which Kali does not ship. This is the
+# single most common cause of "the login box accepts my password then the
+# screen goes black".
+if dpkg-query -W -f='${Status}' xorgxrdp 2>/dev/null | grep -q "install ok"; then
+    pass "xorgxrdp installed -- Xorg backend is usable"
+else
+    if [ "$(apt-cache policy xorgxrdp 2>/dev/null | awk '/Candidate:/{print $2}')" = "(none)" ]; then
+        log "  ${C_DIM}note${C_RESET}  xorgxrdp is unavailable in Kali repos (expected)"
+    else
+        log "  ${C_DIM}note${C_RESET}  xorgxrdp not installed"
+    fi
+    log "        ${C_DIM}-> the Xvnc backend must be used instead; checked below${C_RESET}"
+fi
+
+# --- 2. conflicting display manager -----------------------------------------
+
+step "2. Display manager conflict"
+
+dm_active=0
+for dm in lightdm gdm3 sddm; do
+    if systemctl is-enabled "$dm" >/dev/null 2>&1; then
+        state=$(systemctl is-active "$dm" 2>/dev/null)
+        if [ "$state" = "active" ]; then
+            fail "$dm is enabled and running -- it holds a console session on :0"
+            fix "sudo systemctl disable --now $dm    # or: kali-rdp-setup"
+            dm_active=1
+        else
+            flag "$dm is enabled but not running -- it will return on reboot"
+            fix "sudo systemctl disable $dm"
+            dm_active=1
+        fi
+    fi
+done
+[ "$dm_active" -eq 0 ] && pass "no display manager competing for the console session"
+
+# --- 3. xrdp services -------------------------------------------------------
+
+step "3. Services"
+
+for svc in xrdp xrdp-sesman; do
+    if ! systemctl list-unit-files "$svc.service" >/dev/null 2>&1; then
+        continue
+    fi
+    active=$(systemctl is-active "$svc" 2>/dev/null)
+    if [ "$active" = "active" ]; then
+        pass "$svc is running"
+    elif [ "$svc" = "xrdp-sesman" ] && [ "$active" = "inactive" ] \
+         && systemctl is-active xrdp >/dev/null 2>&1; then
+        # sesman is socket/dependency-activated by xrdp on recent builds.
+        flag "xrdp-sesman inactive while xrdp runs -- sessions will fail to start"
+        fix "sudo systemctl enable --now xrdp-sesman"
+    else
+        fail "$svc is $active"
+        fix "sudo systemctl enable --now $svc"
+    fi
+done
+
+# --- 4. backend configuration ----------------------------------------------
+
+step "4. Session backend"
+
+if [ -f "$XRDP_INI" ]; then
+    port=$(ini_get "$XRDP_INI" Globals port)
+    pass "xrdp listening port configured as ${port:-3389}"
+    if [ -n "$port" ] && ! ss -tlnH 2>/dev/null | grep -q ":$port "; then
+        fail "nothing is listening on port $port"
+        fix "sudo systemctl restart xrdp && sudo journalctl -u xrdp -n 50"
+    elif [ -n "$port" ]; then
+        pass "port $port is accepting connections"
+    fi
+
+    if grep -qE '^\[Xvnc\]' "$XRDP_INI"; then
+        pass "[Xvnc] session type present in xrdp.ini"
+    else
+        fail "no [Xvnc] session type in xrdp.ini"
+        fix "run: sudo kali-rdp-setup"
+    fi
+
+    if grep -qE '^\[Xorg\]' "$XRDP_INI" && ! have Xorg; then
+        flag "[Xorg] session type offered but Xorg backend is unusable here"
+        fix "run: sudo kali-rdp-setup   # comments out the Xorg entry"
+    fi
+else
+    fail "$XRDP_INI not found"
+fi
+
+# xrdp drops to an unprivileged runtime_user, which must still be able to read
+# the TLS key. Debian ships the key as root:ssl-cert 0640, so xrdp has to be in
+# that group. When it is not, the handshake fails with an opaque
+# "xrdp_sec_incoming failed" and clients get disconnected at random.
+key_path=$(ini_get "$XRDP_INI" Globals key_file)
+[ -n "$key_path" ] || key_path="$KRK_XRDP_DIR/key.pem"
+runtime_user=$(ini_get "$XRDP_INI" Globals runtime_user)
+runtime_user=${runtime_user:-xrdp}
+
+if [ -e "$key_path" ] && id "$runtime_user" >/dev/null 2>&1; then
+    real_key=$(readlink -f "$key_path" 2>/dev/null || printf '%s' "$key_path")
+    key_group=$(stat -L -c '%G' "$key_path" 2>/dev/null)
+    if sudo -n -u "$runtime_user" test -r "$real_key" 2>/dev/null; then
+        pass "$runtime_user can read the TLS key"
+    elif [ -n "$key_group" ] && ! id -nG "$runtime_user" 2>/dev/null | tr ' ' '\n' | grep -qx "$key_group"; then
+        fail "$runtime_user is not in group '$key_group' -- cannot read $real_key"
+        fix "sudo usermod -aG $key_group $runtime_user && sudo systemctl restart xrdp"
+        fix "(or just: sudo kali-rdp-setup)"
+    else
+        log "  ${C_DIM}note${C_RESET}  could not verify TLS key readability as $runtime_user"
+    fi
+fi
+if grep -qiE 'Cannot read private key file' /var/log/xrdp.log 2>/dev/null; then
+    fail "xrdp.log reports it cannot read the private key -- TLS handshakes fail"
+    fix "sudo kali-rdp-setup   # adds $runtime_user to the key's group"
+fi
+
+# --- 5. disconnected-session policy ----------------------------------------
+
+step "5. Disconnected session policy"
+
+if [ -f "$SESMAN_INI" ]; then
+    kd=$(ini_get "$SESMAN_INI" Sessions KillDisconnected)
+    dt=$(ini_get "$SESMAN_INI" Sessions DisconnectedTimeLimit)
+    if [ "$kd" = "true" ] || [ "$kd" = "1" ]; then
+        pass "KillDisconnected=$kd"
+    else
+        fail "KillDisconnected=${kd:-unset} -- abandoned sessions accumulate forever"
+        fix "run: sudo kali-rdp-setup"
+    fi
+    if [ -n "$dt" ] && [ "$dt" != "0" ]; then
+        pass "DisconnectedTimeLimit=${dt}s"
+    else
+        flag "DisconnectedTimeLimit=${dt:-unset} -- with 0 the kill never fires"
+        fix "run: sudo kali-rdp-setup"
+    fi
+    ms=$(ini_get "$SESMAN_INI" Sessions MaxSessions)
+    [ -n "$ms" ] && [ "$ms" -gt 20 ] 2>/dev/null && \
+        flag "MaxSessions=$ms is high; orphans can pile up before the cap bites"
+else
+    fail "$SESMAN_INI not found"
+fi
+
+# --- 6. live sessions and orphans ------------------------------------------
+
+step "6. Live sessions"
+
+sessions=$(krk_xvnc_sessions)
+if [ -z "$sessions" ]; then
+    log "  no Xvnc sessions running"
+else
+    live_displays=""
+    while read -r pid display; do
+        [ -n "${pid:-}" ] || continue
+        cpu=$(ps -o %cpu= -p "$pid" 2>/dev/null | tr -d ' ')
+        et=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
+        if krk_display_connected "$display"; then
+            pass ":$display  pid $pid  up $et  cpu ${cpu}%  -- client attached"
+            live_displays="$live_displays $display"
+        else
+            flag ":$display  pid $pid  up $et  cpu ${cpu}%  -- NO client attached"
+            fix "sudo kali-rdp-cleanup --dry-run    # to preview reaping it"
+        fi
+        # Runaway CPU on an X server is the classic orphan signature.
+        if [ -n "$cpu" ] && [ "${cpu%%.*}" -ge 80 ] 2>/dev/null; then
+            fail ":$display is burning ${cpu}% CPU -- likely a spinning orphan"
+        fi
+    done <<<"$sessions"
+fi
+
+step "7. Orphaned helper processes"
+
+orphan_total=0
+count_orphans() {
+    local pattern=$1 label=$2 n=0 pid d
+    for pid in $(pgrep -f "$pattern" 2>/dev/null); do
+        d=$(krk_proc_env "$pid" DISPLAY); d=${d#:}; d=${d%%.*}
+        if [ -z "$d" ]; then
+            [ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" = "1" ] \
+                && [ -z "$sessions" ] && n=$(( n + 1 ))
+            continue
+        fi
+        printf '%s' " $(echo "$sessions" | awk '{print $2}' | tr '\n' ' ') " \
+            | grep -q " $d " || n=$(( n + 1 ))
+    done
+    if [ "$n" -gt 0 ]; then
+        flag "$n orphaned $label process(es)"
+        orphan_total=$(( orphan_total + n ))
+    else
+        pass "no orphaned $label processes"
+    fi
+}
+
+count_orphans "xrdp-chansrv"            "xrdp-chansrv"
+count_orphans "libpipewire-module-xrdp" "pipewire-xrdp module"
+
+if [ "$orphan_total" -gt 0 ]; then
+    fix "sudo kali-rdp-cleanup --dry-run     # preview"
+    fix "sudo kali-rdp-cleanup               # reap"
+fi
+
+if systemctl list-unit-files kali-rdp-cleanup.timer >/dev/null 2>&1 \
+   && systemctl is-enabled kali-rdp-cleanup.timer >/dev/null 2>&1; then
+    pass "kali-rdp-cleanup.timer is enabled"
+else
+    flag "automatic cleanup timer not enabled -- orphans will accumulate"
+    fix "sudo systemctl enable --now kali-rdp-cleanup.timer"
+fi
+
+# --- 8. logs ----------------------------------------------------------------
+
+step "8. Recent errors in xrdp logs"
+
+log_hits=0
+for f in /var/log/xrdp-sesman.log /var/log/xrdp.log; do
+    [ -r "$f" ] || continue
+    hits=$(grep -iE '\[ERROR\]|\[WARN\]' "$f" 2>/dev/null | tail -5)
+    if [ -n "$hits" ]; then
+        log "  ${C_DIM}$f${C_RESET}"
+        printf '%s\n' "$hits" | sed 's/^/    /'
+        log_hits=1
+    fi
+done
+[ "$log_hits" -eq 0 ] && pass "no recent errors or warnings in xrdp logs"
+
+# --- summary ----------------------------------------------------------------
+
+echo
+if [ "$FAILURES" -gt 0 ]; then
+    printf '%s%d failure(s), %d warning(s)%s\n' "$C_RED" "$FAILURES" "$WARNINGS" "$C_RESET"
+    exit 2
+elif [ "$WARNINGS" -gt 0 ]; then
+    printf '%s%d warning(s), no failures%s\n' "$C_YEL" "$WARNINGS" "$C_RESET"
+    exit 1
+fi
+printf '%sall checks passed%s\n' "$C_GRN" "$C_RESET"

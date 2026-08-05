@@ -1,0 +1,32 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        mkdir -p /var/lib/kali-rdp-kit/backups
+        chmod 0750 /var/lib/kali-rdp-kit
+
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            # Enable the timer but do not reconfigure xrdp behind the admin's
+            # back -- that is what kali-rdp-setup is for, and it is explicit.
+            systemctl enable --now kali-rdp-cleanup.timer >/dev/null 2>&1 || true
+        fi
+
+        cat <<'EOF'
+
+kali-rdp-kit installed.
+
+  Next:  sudo kali-rdp-setup --dry-run    # review the changes
+         sudo kali-rdp-setup              # apply them
+         kali-rdp-doctor                  # verify
+
+The orphan cleanup timer is already running. Nothing else has been changed.
+
+EOF
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+esac
+
+exit 0

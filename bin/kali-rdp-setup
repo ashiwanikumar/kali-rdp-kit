@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+#
+# kali-rdp-setup -- make xrdp on Kali actually work, idempotently.
+#
+# Every change is backed up under /var/lib/kali-rdp-kit/backups/<timestamp>/
+# and every step is safe to re-run.
+#
+set -uo pipefail
+
+KRK_LIB="${KRK_LIB:-/usr/lib/kali-rdp-kit}"
+KRK_SHARE="${KRK_SHARE:-/usr/share/kali-rdp-kit}"
+# shellcheck source=../lib/common.sh
+. "$KRK_LIB/common.sh" || { echo "cannot load $KRK_LIB/common.sh" >&2; exit 1; }
+
+KRK_DRY_RUN=0
+KEEP_DM=0
+NO_TMUX=0
+NO_TIMER=0
+DISCONNECT_LIMIT=1800
+RDP_PORT=""
+CHANGED=0
+
+usage() {
+    cat <<'EOF'
+Usage: sudo kali-rdp-setup [options]
+
+Configure xrdp on Kali for reliable headless RDP:
+  * disable the display manager that fights RDP for the console session
+  * force the Xvnc backend (Kali has no xorgxrdp package)
+  * make sesman reap disconnected sessions
+  * install a cleanup timer for orphaned session processes
+  * drop in a tmux config that stops multi-client redraw corruption
+
+Options:
+  -n, --dry-run            print what would change, change nothing
+      --keep-dm            leave lightdm/gdm3/sddm alone (console GUI needed)
+      --port PORT          set the xrdp listening port (default: leave as-is)
+      --disconnect-limit S seconds before a disconnected session is killed (1800)
+      --no-tmux            skip the tmux config
+      --no-timer           skip the cleanup systemd timer
+  -h, --help               this message
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        -n|--dry-run)        KRK_DRY_RUN=1 ;;
+        --keep-dm)           KEEP_DM=1 ;;
+        --port)              RDP_PORT=${2:?--port needs a value}; shift ;;
+        --disconnect-limit)  DISCONNECT_LIMIT=${2:?--disconnect-limit needs a value}; shift ;;
+        --no-tmux)           NO_TMUX=1 ;;
+        --no-timer)          NO_TIMER=1 ;;
+        -h|--help)           usage; exit 0 ;;
+        *)                   err "unknown option: $1"; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+export KRK_DRY_RUN
+
+require_root
+krk_init_state
+
+SESMAN_INI="$KRK_XRDP_DIR/sesman.ini"
+XRDP_INI="$KRK_XRDP_DIR/xrdp.ini"
+
+note_change() { CHANGED=$(( CHANGED + 1 )); }
+
+printf '%skali-rdp-setup %s%s\n' "$C_BOLD" "$KRK_VERSION" "$C_RESET"
+[ "$KRK_DRY_RUN" = 1 ] && info "dry run -- no changes will be made"
+[ "$KRK_DRY_RUN" = 1 ] || info "backups: $KRK_BACKUP_DIR/$KRK_RUN_ID"
+
+# --- 1. packages ------------------------------------------------------------
+
+step "1. Packages"
+
+missing=""
+for pkg in xrdp tigervnc-standalone-server; do
+    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" \
+        || missing="$missing $pkg"
+done
+[ "$NO_TMUX" = 0 ] && ! have tmux && missing="$missing tmux"
+
+if [ -n "$missing" ]; then
+    info "installing:$missing"
+    run env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    # shellcheck disable=SC2086
+    run env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $missing \
+        || die "package installation failed"
+    note_change
+else
+    ok "all required packages present"
+fi
+
+# xorgxrdp is simply not in Kali's repos; that is why the Xorg backend hangs.
+if [ "$(apt-cache policy xorgxrdp 2>/dev/null | awk '/Candidate:/{print $2}')" = "(none)" ]; then
+    ok "xorgxrdp unavailable as expected -- using the Xvnc backend"
+fi
+
+# --- 2. display manager -----------------------------------------------------
+
+step "2. Display manager"
+
+if [ "$KEEP_DM" = 1 ]; then
+    warn "--keep-dm given; leaving display managers enabled"
+    warn "a console session on :0 shares this user's D-Bus and ICEauthority with"
+    warn "RDP sessions, which is the usual cause of session-start races"
+else
+    touched_dm=0
+    for dm in lightdm gdm3 sddm; do
+        systemctl list-unit-files "$dm.service" >/dev/null 2>&1 || continue
+        if systemctl is-enabled "$dm" >/dev/null 2>&1; then
+            info "disabling $dm (console GUI is not needed for RDP)"
+            run systemctl disable --now "$dm"
+            note_change; touched_dm=1
+        fi
+    done
+    [ "$touched_dm" -eq 0 ] && ok "no display manager enabled"
+    # Without a DM the box should boot to multi-user, or systemd starts one anyway.
+    current_target=$(systemctl get-default 2>/dev/null)
+    if [ "$current_target" = "graphical.target" ]; then
+        info "switching default target to multi-user.target"
+        run systemctl set-default multi-user.target
+        note_change
+    else
+        ok "default target is $current_target"
+    fi
+fi
+
+# --- 3. xrdp backend --------------------------------------------------------
+
+step "3. xrdp backend"
+
+[ -f "$XRDP_INI" ] || die "$XRDP_INI missing -- is xrdp installed?"
+
+if ! grep -qE '^\[Xvnc\]' "$XRDP_INI"; then
+    die "no [Xvnc] section in xrdp.ini; refusing to guess at its contents"
+fi
+ok "[Xvnc] session type present"
+
+# Comment out the Xorg entry so the login dropdown cannot offer a backend that
+# will hang. Leave the section body intact so --keep-dm users can restore it.
+if grep -qE '^\[Xorg\]' "$XRDP_INI" && ! have Xorg; then
+    info "disabling the unusable [Xorg] session type"
+    if [ "$KRK_DRY_RUN" = 1 ]; then
+        printf '%s  would comment out%s [Xorg] in xrdp.ini\n' "$C_DIM" "$C_RESET"
+    else
+        backup_file "$XRDP_INI"
+        tmp=$(mktemp)
+        awk '/^\[Xorg\]/ { print "; disabled by kali-rdp-setup: no xorgxrdp on Kali"
+                           print ";" $0; in_x = 1; next }
+             /^\[/      { in_x = 0 }
+             in_x && NF { print ";" $0; next }
+             { print }' "$XRDP_INI" >"$tmp" && cat "$tmp" >"$XRDP_INI"
+        rm -f "$tmp"
+    fi
+    note_change
+else
+    ok "no conflicting Xorg session type to disable"
+fi
+
+if [ -n "$RDP_PORT" ]; then
+    if ini_set "$XRDP_INI" Globals port "$RDP_PORT"; then
+        info "xrdp port set to $RDP_PORT"; note_change
+    else
+        ok "xrdp port already $RDP_PORT"
+    fi
+else
+    ok "listening port left at $(ini_get "$XRDP_INI" Globals port)"
+fi
+
+# Xvnc must stay bound to loopback; xrdp is the only thing that should reach it.
+if grep -qE '^\s*param=-localhost' "$SESMAN_INI"; then
+    ok "Xvnc restricted to localhost"
+else
+    warn "Xvnc is not started with -localhost; its VNC port may be world-reachable"
+    warn "add 'param=-localhost' under [Xvnc] in $SESMAN_INI"
+fi
+
+# xrdp runs as an unprivileged user but must read the TLS key, which Debian
+# ships as root:ssl-cert 0640. Without group membership the handshake fails
+# with an unhelpful "xrdp_sec_incoming failed" and clients drop at random.
+key_path=$(ini_get "$XRDP_INI" Globals key_file)
+[ -n "$key_path" ] || key_path="$KRK_XRDP_DIR/key.pem"
+runtime_user=$(ini_get "$XRDP_INI" Globals runtime_user)
+runtime_user=${runtime_user:-xrdp}
+
+if [ -e "$key_path" ] && id "$runtime_user" >/dev/null 2>&1; then
+    key_group=$(stat -L -c '%G' "$key_path" 2>/dev/null)
+    if [ -n "$key_group" ] && [ "$key_group" != "root" ] \
+       && ! id -nG "$runtime_user" 2>/dev/null | tr ' ' '\n' | grep -qx "$key_group"; then
+        info "adding $runtime_user to group $key_group so it can read the TLS key"
+        run usermod -aG "$key_group" "$runtime_user"
+        note_change
+    else
+        ok "$runtime_user can reach the TLS key (group $key_group)"
+    fi
+fi
+
+# --- 4. disconnected session policy ----------------------------------------
+
+step "4. Disconnected session policy"
+
+[ -f "$SESMAN_INI" ] || die "$SESMAN_INI missing"
+
+if ini_set "$SESMAN_INI" Sessions KillDisconnected true; then
+    info "KillDisconnected=true"; note_change
+else
+    ok "KillDisconnected already true"
+fi
+
+if ini_set "$SESMAN_INI" Sessions DisconnectedTimeLimit "$DISCONNECT_LIMIT"; then
+    info "DisconnectedTimeLimit=$DISCONNECT_LIMIT"; note_change
+else
+    ok "DisconnectedTimeLimit already $DISCONNECT_LIMIT"
+fi
+
+# --- 5. cleanup timer -------------------------------------------------------
+
+step "5. Orphan cleanup timer"
+
+if [ "$NO_TIMER" = 1 ]; then
+    warn "--no-timer given; skipping"
+elif [ -f /usr/lib/systemd/system/kali-rdp-cleanup.timer ] \
+  || [ -f /lib/systemd/system/kali-rdp-cleanup.timer ]; then
+    if systemctl is-enabled kali-rdp-cleanup.timer >/dev/null 2>&1; then
+        ok "kali-rdp-cleanup.timer already enabled"
+    else
+        run systemctl daemon-reload
+        run systemctl enable --now kali-rdp-cleanup.timer
+        info "kali-rdp-cleanup.timer enabled"; note_change
+    fi
+else
+    warn "cleanup timer unit not installed (running from a git checkout?)"
+    warn "install the package, or copy share/systemd/*.{service,timer} to /etc/systemd/system"
+fi
+
+# A user crontab calling the old cleanup script will fight this timer.
+if crontab -l -u "${SUDO_USER:-root}" 2>/dev/null | grep -q "cleanup-xrdp"; then
+    warn "found a cleanup-xrdp.sh entry in ${SUDO_USER:-root}'s crontab"
+    warn "remove it -- it reaps by uptime and will kill sessions you are using:"
+    warn "  crontab -e"
+fi
+
+# --- 6. tmux ----------------------------------------------------------------
+
+step "6. tmux configuration"
+
+if [ "$NO_TMUX" = 1 ]; then
+    warn "--no-tmux given; skipping"
+else
+    target_user=${SUDO_USER:-root}
+    target_home=$(getent passwd "$target_user" | cut -d: -f6)
+    src="$KRK_SHARE/tmux.conf"
+    dst="$target_home/.tmux.conf"
+    if [ ! -f "$src" ]; then
+        warn "$src not found (running from a git checkout?); skipping"
+    elif [ -f "$dst" ] && grep -q "kali-rdp-kit" "$dst" 2>/dev/null; then
+        ok "tmux config already managed by kali-rdp-kit"
+    elif [ -f "$dst" ]; then
+        warn "$dst exists and is not ours; leaving it alone"
+        warn "to adopt our settings: cat $src >> $dst"
+    else
+        run install -o "$target_user" -g "$target_user" -m 0644 "$src" "$dst"
+        info "installed $dst"; note_change
+    fi
+fi
+
+# --- 7. restart -------------------------------------------------------------
+
+step "7. Restart services"
+
+if [ "$CHANGED" -eq 0 ]; then
+    ok "nothing changed; not restarting xrdp"
+else
+    info "restarting xrdp and xrdp-sesman"
+    run systemctl enable xrdp xrdp-sesman >/dev/null 2>&1
+    run systemctl restart xrdp-sesman
+    run systemctl restart xrdp
+fi
+
+echo
+if [ "$KRK_DRY_RUN" = 1 ]; then
+    info "dry run complete -- $CHANGED change(s) would have been made"
+else
+    info "setup complete -- $CHANGED change(s) made"
+    log "  verify with: kali-rdp-doctor"
+fi

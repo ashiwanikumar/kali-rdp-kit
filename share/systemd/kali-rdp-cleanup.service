@@ -1,0 +1,17 @@
+[Unit]
+Description=Reap orphaned xrdp session processes
+Documentation=https://github.com/ashvani/kali-rdp-kit
+After=xrdp.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/kali-rdp-cleanup
+Nice=10
+
+# The job's whole purpose is to signal processes outside its own cgroup, so it
+# cannot be confined much -- but it needs nothing else.
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/lib/kali-rdp-kit
+NoNewPrivileges=true

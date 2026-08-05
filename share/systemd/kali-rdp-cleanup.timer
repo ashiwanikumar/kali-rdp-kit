@@ -1,0 +1,15 @@
+[Unit]
+Description=Periodic reap of orphaned xrdp session processes
+Documentation=https://github.com/ashvani/kali-rdp-kit
+
+[Timer]
+# Every 10 minutes. The grace period in kali-rdp-cleanup (default 30 min) is
+# what actually decides when something dies, so polling often is cheap and
+# only makes the decision more accurate.
+OnBootSec=5min
+OnUnitActiveSec=10min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

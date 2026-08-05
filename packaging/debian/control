@@ -1,0 +1,23 @@
+Package: kali-rdp-kit
+Version: 0.1.0
+Section: admin
+Priority: optional
+Architecture: all
+Maintainer: ashvani <dpac9525@gmail.com>
+Depends: bash (>= 5.0), xrdp, tigervnc-standalone-server, procps, iproute2
+Recommends: tmux
+Suggests: openbox
+Homepage: https://github.com/ashvani/kali-rdp-kit
+Description: Reliable headless RDP setup for Kali Linux
+ Configures and repairs xrdp on Kali, where the usual Xorg backend cannot be
+ used because the xorgxrdp driver is absent from the archive.
+ .
+ Ships three tools:
+  * kali-rdp-setup   -- idempotent configuration: disables the competing
+    display manager, forces the Xvnc backend, and sets a disconnected-session
+    policy so abandoned sessions do not accumulate.
+  * kali-rdp-doctor  -- read-only diagnostics that name the specific
+    misconfiguration and the command that fixes it.
+  * kali-rdp-cleanup -- reaps orphaned Xvnc, xrdp-chansrv and pipewire-xrdp
+    processes, keyed on whether an RDP client is attached rather than on
+    process uptime, so sessions in active use are never killed.

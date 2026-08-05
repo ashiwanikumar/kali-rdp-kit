@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+#
+# kali-rdp-cleanup -- reap orphaned xrdp session processes.
+#
+# Reaps by *disconnected-ness*, not uptime. A session with no RDP client
+# attached is recorded on first sighting and killed only if it is still
+# unattached after a grace period, so a long-lived session you are actively
+# using is never touched.
+#
+set -uo pipefail
+
+KRK_LIB="${KRK_LIB:-/usr/lib/kali-rdp-kit}"
+# shellcheck source=../lib/common.sh
+. "$KRK_LIB/common.sh" || { echo "cannot load $KRK_LIB/common.sh" >&2; exit 1; }
+
+GRACE_SECONDS=${KRK_GRACE_SECONDS:-1800}
+KRK_DRY_RUN=0
+VERBOSE=0
+SEEN_FILE=""
+
+usage() {
+    cat <<'EOF'
+Usage: kali-rdp-cleanup [options]
+
+Reap orphaned Xvnc / xrdp-chansrv / pipewire-xrdp processes left behind by
+RDP clients that disconnected without logging out.
+
+Options:
+  -n, --dry-run          report what would be killed, change nothing
+  -g, --grace SECONDS    unattached time before reaping (default: 1800)
+  -v, --verbose          also report sessions that were left alone
+  -h, --help             this message
+
+Exit status is 0 even when nothing is reaped; it is non-zero only on error.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        -n|--dry-run) KRK_DRY_RUN=1 ;;
+        -g|--grace)   GRACE_SECONDS=${2:?--grace needs a value}; shift ;;
+        -v|--verbose) VERBOSE=1 ;;
+        -h|--help)    usage; exit 0 ;;
+        *)            err "unknown option: $1"; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+export KRK_DRY_RUN
+
+krk_init_state
+
+# State lives beside the rest of our state as root, or under XDG when a user
+# runs this by hand. Either way it only ever holds "display -> first seen
+# disconnected" epochs.
+if [ "$(id -u)" -eq 0 ]; then
+    SEEN_FILE="$KRK_STATE_DIR/disconnected.state"
+else
+    SEEN_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/kali-rdp-kit/disconnected.state"
+    [ "$KRK_DRY_RUN" = 1 ] || mkdir -p "$(dirname "$SEEN_FILE")"
+fi
+[ "$KRK_DRY_RUN" = 1 ] || : >>"$SEEN_FILE"
+
+now=$(date +%s)
+reaped=0
+live_displays=""
+
+# Normalise a DISPLAY value (":18", ":18.0", "18") down to its number.
+disp_num() { local d=${1#:}; printf '%s' "${d%%.*}"; }
+
+# Whitespace-delimited membership test, so ":1" never matches ":18".
+in_list() {
+    local needle=$1 hay=$2 item
+    for item in $hay; do [ "$item" = "$needle" ] && return 0; done
+    return 1
+}
+
+seen_get()  { [ -f "$SEEN_FILE" ] && awk -v d="$1" '$1==d {print $2; exit}' "$SEEN_FILE"; }
+seen_set()  {
+    [ "$KRK_DRY_RUN" = 1 ] && return 0
+    local tmp; tmp=$(mktemp)
+    { [ -f "$SEEN_FILE" ] && awk -v d="$1" '$1!=d' "$SEEN_FILE"; echo "$1 $2"; } >"$tmp"
+    mv "$tmp" "$SEEN_FILE"
+}
+seen_clear() {
+    [ "$KRK_DRY_RUN" = 1 ] && return 0
+    [ -f "$SEEN_FILE" ] || return 0
+    local tmp; tmp=$(mktemp)
+    awk -v d="$1" '$1!=d' "$SEEN_FILE" >"$tmp"
+    mv "$tmp" "$SEEN_FILE"
+}
+
+# Kill a process group politely, then firmly.
+reap() {
+    local pid=$1 what=$2
+    kill -0 "$pid" 2>/dev/null || return 0
+    if [ "$KRK_DRY_RUN" = 1 ]; then
+        printf '%s  would reap%s %s (pid %s)\n' "$C_DIM" "$C_RESET" "$what" "$pid"
+        return 0
+    fi
+    kill -TERM "$pid" 2>/dev/null
+    for _ in 1 2 3 4 5; do
+        sleep 1
+        kill -0 "$pid" 2>/dev/null || { ok "reaped $what (pid $pid)"; return 0; }
+    done
+    kill -KILL "$pid" 2>/dev/null
+    ok "reaped $what (pid $pid, needed SIGKILL)"
+}
+
+step "Xvnc sessions"
+
+while read -r pid display; do
+    [ -n "${pid:-}" ] || continue
+    if krk_display_connected "$display"; then
+        live_displays="$live_displays $display"
+        seen_clear "$display"
+        [ "$VERBOSE" = 1 ] && ok ":$display -- client attached, leaving alone"
+        continue
+    fi
+
+    first=$(seen_get "$display")
+    if [ -z "$first" ]; then
+        seen_set "$display" "$now"
+        info ":$display -- unattached, starting ${GRACE_SECONDS}s grace period"
+        live_displays="$live_displays $display"
+        continue
+    fi
+
+    idle=$(( now - first ))
+    if [ "$idle" -lt "$GRACE_SECONDS" ]; then
+        info ":$display -- unattached for ${idle}s, grace not elapsed"
+        live_displays="$live_displays $display"
+        continue
+    fi
+
+    warn ":$display -- unattached for ${idle}s, reaping session"
+    # chansrv and the window manager hang off the same display; take the whole
+    # session down so nothing is left holding the socket dir.
+    for spid in $(pgrep -f "xrdp-chansrv" 2>/dev/null); do
+        [ "$(disp_num "$(krk_proc_env "$spid" DISPLAY)")" = "$display" ] \
+            && reap "$spid" "xrdp-chansrv for :$display"
+    done
+    reap "$pid" "Xvnc :$display"
+    seen_clear "$display"
+    reaped=$(( reaped + 1 ))
+done <<<"$(krk_xvnc_sessions)"
+
+[ -z "$(krk_xvnc_sessions)" ] && log "  (no Xvnc sessions running)"
+
+step "Stray xrdp-chansrv"
+
+# A chansrv whose display no longer has an Xvnc is unambiguously orphaned.
+for pid in $(pgrep -f "xrdp-chansrv" 2>/dev/null); do
+    d=$(disp_num "$(krk_proc_env "$pid" DISPLAY)")
+    if [ -z "$d" ]; then
+        [ "$VERBOSE" = 1 ] && warn "chansrv pid $pid -- DISPLAY unreadable, leaving alone"
+        continue
+    fi
+    if ! in_list "$d" "$live_displays"; then
+        reap "$pid" "orphaned xrdp-chansrv (:$d)"
+        reaped=$(( reaped + 1 ))
+    elif [ "$VERBOSE" = 1 ]; then
+        ok "xrdp-chansrv for :$d -- session live, leaving alone"
+    fi
+done
+
+step "Stray pipewire xrdp modules"
+
+# xrdp's pipewire module is launched per session via pw-cli and is *not* torn
+# down when the session dies -- it reparents to init and lingers forever. Match
+# it back to its display and reap the ones whose session is gone.
+for pid in $(pgrep -f "libpipewire-module-xrdp" 2>/dev/null); do
+    d=$(disp_num "$(krk_proc_env "$pid" DISPLAY)")
+    if [ -z "$d" ]; then
+        # No DISPLAY to match on. Only reap if it has been reparented to init
+        # and no session is running at all -- otherwise leave it be.
+        if [ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" = "1" ] \
+           && [ -z "$(krk_xvnc_sessions)" ]; then
+            reap "$pid" "orphaned pipewire-xrdp module (no live sessions)"
+            reaped=$(( reaped + 1 ))
+        elif [ "$VERBOSE" = 1 ]; then
+            warn "pw-cli pid $pid -- DISPLAY unreadable, leaving alone"
+        fi
+        continue
+    fi
+    if ! in_list "$d" "$live_displays"; then
+        reap "$pid" "orphaned pipewire-xrdp module (:$d)"
+        reaped=$(( reaped + 1 ))
+    elif [ "$VERBOSE" = 1 ]; then
+        ok "pipewire-xrdp for :$d -- session live, leaving alone"
+    fi
+done
+
+echo
+if [ "$KRK_DRY_RUN" = 1 ]; then
+    info "dry run -- nothing was killed"
+else
+    info "done -- reaped $reaped process(es)"
+fi
