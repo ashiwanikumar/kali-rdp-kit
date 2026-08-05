@@ -4,6 +4,12 @@
 #
 set -euo pipefail
 
+# Directory modes come from the build tree, so a builder with a permissive
+# umask (002 is common on Debian/Kali, where users get a private group) would
+# otherwise ship group-writable directories -- a lintian error, and a package
+# that differs from the one CI publishes. Pin it.
+umask 022
+
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 VERSION=$(awk -F'"' '/^KRK_VERSION=/{print $2}' "$ROOT/lib/common.sh")
 [ -n "$VERSION" ] || { echo "cannot determine version from lib/common.sh" >&2; exit 1; }
