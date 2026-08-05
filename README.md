@@ -45,7 +45,7 @@ Safe to re-run; every file it touches is backed up to
 |---|---|
 | Display manager | Disables `lightdm`/`gdm3`/`sddm` and switches the default target to `multi-user`. A console session on `:0` shares the user's D-Bus session bus, `ICEauthority`, and agent sockets with RDP sessions; both fight over them. Keep it with `--keep-dm`. |
 | Backend | Verifies the `[Xvnc]` session type and comments out `[Xorg]`, so the login dropdown cannot offer a backend that will hang. |
-| Session policy | Sets `KillDisconnected=true` and `DisconnectedTimeLimit` in `sesman.ini`. |
+| Session policy | Sets `KillDisconnected=true` and `DisconnectedTimeLimit` in `sesman.ini` — correct for the day xorgxrdp lands, but **inert on Xvnc** (see below). |
 | Cleanup | Enables the `kali-rdp-cleanup.timer`. |
 | tmux | Installs a config that stops multi-client redraw corruption. Never overwrites an existing `~/.tmux.conf`. |
 
@@ -83,6 +83,19 @@ sudo kali-rdp-cleanup [-n|--dry-run] [-g|--grace SECONDS] [-v|--verbose]
 ```
 
 `--dry-run` is worth running first; it prints exactly what would die.
+
+**Your apps stay open when you disconnect** — closing an RDP client is not a
+logout. The desktop and everything in it keeps running, and reconnecting puts
+you back in it. The grace period is how long a *disconnected* session is kept
+before it is reaped; raise it if you want desktops to park for days:
+
+```bash
+sudo systemctl edit kali-rdp-cleanup.service   # Environment=KRK_GRACE_SECONDS=86400
+```
+
+See [docs/session-persistence.md](docs/session-persistence.md) for the full
+picture, including why reconnecting sometimes hands you an empty desktop while
+your windows are still running in another session.
 
 ### `kali-rdp-profile` — desktop profiles
 
@@ -164,10 +177,19 @@ sessions that start then immediately exit, D-Bus errors, a dead keyring.
 xorgxrdp` returning `Candidate: (none)`. Without it the Xorg backend attempts
 to touch real graphics hardware. The Xvnc backend needs no such driver.
 
-**3. Session processes outlive their sessions.** `KillDisconnected` handles the
-clean case. It does not cover helpers that reparent to init — notably xrdp's
-pipewire module, which lingers indefinitely. On the machine this was built for,
-21 of them had accumulated over six days.
+**3. Session processes outlive their sessions, and sesman will not stop it.**
+This is the one that surprises people. `sesman.ini(5)` states that
+`KillDisconnected` and `DisconnectedTimeLimit` *"currently only work with
+xorgxrdp sessions"*. Kali has no xorgxrdp, so on every Kali box those keys are
+accepted, look correct in the config, and do nothing.
+
+The practical consequence: on an Xvnc backend **nothing in xrdp reaps
+disconnected sessions**. That job falls entirely to `kali-rdp-cleanup`. A
+config that reads as properly tuned will still accumulate sessions forever.
+
+Helpers that reparent to init are not covered by any xrdp mechanism either —
+notably xrdp's pipewire module. On the machine this was built for, 21 had
+accumulated over six days.
 
 **4. Multiple tmux clients on one session.** tmux resizes the window to the
 smallest attached client on every attach. Over RDP that reads as redraw

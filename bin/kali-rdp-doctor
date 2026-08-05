@@ -234,18 +234,60 @@ step "5. Disconnected session policy"
 if [ -f "$SESMAN_INI" ]; then
     kd=$(ini_get "$SESMAN_INI" Sessions KillDisconnected)
     dt=$(ini_get "$SESMAN_INI" Sessions DisconnectedTimeLimit)
-    if [ "$kd" = "true" ] || [ "$kd" = "1" ]; then
-        pass "KillDisconnected=$kd"
+
+    # sesman.ini(5): "KillDisconnected ... currently only works with xorgxrdp
+    # sessions", and the same for DisconnectedTimeLimit. On Kali there is no
+    # xorgxrdp, so these keys are accepted and then ignored. Reporting them as
+    # a pass would be actively misleading -- it is the reason sessions pile up
+    # on a box whose config looks correct.
+    if krk_xorgxrdp_usable; then
+        if [ "$kd" = "true" ] || [ "$kd" = "1" ]; then
+            pass "KillDisconnected=$kd (enforced: xorgxrdp backend)"
+        else
+            fail "KillDisconnected=${kd:-unset} -- abandoned sessions accumulate"
+            fix "run: sudo kali-rdp-setup"
+        fi
+        if [ -n "$dt" ] && [ "$dt" != "0" ]; then
+            pass "DisconnectedTimeLimit=${dt}s"
+        else
+            flag "DisconnectedTimeLimit=${dt:-unset} -- with 0 the kill never fires"
+            fix "run: sudo kali-rdp-setup"
+        fi
     else
-        fail "KillDisconnected=${kd:-unset} -- abandoned sessions accumulate forever"
-        fix "run: sudo kali-rdp-setup"
+        log "  ${C_DIM}note${C_RESET}  KillDisconnected=${kd:-unset} / DisconnectedTimeLimit=${dt:-unset}"
+        log "        ${C_DIM}are set but INERT: sesman only honours them for xorgxrdp${C_RESET}"
+        log "        ${C_DIM}sessions, and this host uses Xvnc. Session reaping here${C_RESET}"
+        log "        ${C_DIM}is done entirely by kali-rdp-cleanup.${C_RESET}"
+        if systemctl is-enabled kali-rdp-cleanup.timer >/dev/null 2>&1; then
+            pass "kali-rdp-cleanup is enabled, so disconnected sessions are reaped"
+        else
+            fail "nothing is reaping disconnected sessions on this host"
+            fix "sudo systemctl enable --now kali-rdp-cleanup.timer"
+        fi
     fi
-    if [ -n "$dt" ] && [ "$dt" != "0" ]; then
-        pass "DisconnectedTimeLimit=${dt}s"
-    else
-        flag "DisconnectedTimeLimit=${dt:-unset} -- with 0 the kill never fires"
-        fix "run: sudo kali-rdp-setup"
-    fi
+
+    # Policy=Default is "UB": sessions are keyed on user AND bits-per-pixel.
+    # Reconnecting with a client negotiating a different colour depth therefore
+    # starts a *new* desktop instead of rejoining the old one -- the classic
+    # "where did my windows go", and a steady source of duplicate sessions.
+    pol=$(ini_get "$SESMAN_INI" Sessions Policy)
+    # Match the two literal keywords before testing for the UBDI letter flags:
+    # "Default" contains a D but does not mean the D criterion.
+    case ${pol:-Default} in
+        ""|Default)
+            pass "Policy=Default (= UB) -- reconnecting rejoins the existing session"
+            log "        ${C_DIM}(a client negotiating a different colour depth still starts${C_RESET}"
+            log "        ${C_DIM} a separate session; the B criterion cannot be disabled)${C_RESET}" ;;
+        Separate)
+            flag "Policy=Separate -- every connection starts a new session, none are ever rejoined"
+            fix "set Policy=Default in $SESMAN_INI unless you truly want this" ;;
+        *D*)
+            flag "Policy=$pol includes D -- a different client window size starts a NEW session"
+            fix "drop D from Policy in $SESMAN_INI to let clients rejoin" ;;
+        *)
+            pass "Policy=$pol -- reconnecting rejoins the existing session" ;;
+    esac
+
     ms=$(ini_get "$SESMAN_INI" Sessions MaxSessions)
     [ -n "$ms" ] && [ "$ms" -gt 20 ] 2>/dev/null && \
         flag "MaxSessions=$ms is high; orphans can pile up before the cap bites"
