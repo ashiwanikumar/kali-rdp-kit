@@ -59,8 +59,11 @@ jobs:
           sudo install -d /usr/lib/kali-rdp-kit
           sudo install -m 0644 lib/common.sh /usr/lib/kali-rdp-kit/
           # doctor exits 1/2 on an unconfigured box; only a crash is a failure.
-          bash bin/kali-rdp-doctor; rc=$?
+          # Capture with || so `set -e` does not abort on the expected non-zero
+          # exit before the check runs.
+          rc=0; bash bin/kali-rdp-doctor || rc=$?
           [ "$rc" -le 2 ] || { echo "doctor crashed (rc=$rc)"; exit 1; }
+          echo "doctor exited $rc as expected"
           sudo bash bin/kali-rdp-cleanup --dry-run
           sudo bash bin/kali-rdp-setup --dry-run --no-tmux --no-timer || true
           # JSON output must stay parseable -- nothing may leak onto stdout.
