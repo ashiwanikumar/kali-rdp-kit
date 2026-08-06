@@ -17,8 +17,15 @@ jobs:
           shellcheck --severity=warning \
             bin/kali-rdp-setup bin/kali-rdp-doctor bin/kali-rdp-cleanup \
             bin/kali-rdp-user bin/kali-rdp-profile bin/kali-ssh-setup \
-            install.sh packaging/build-deb.sh lib/common.sh \
+            install.sh packaging/build-deb.sh lib/common.sh tests/run-tests.sh \
             packaging/debian/postinst packaging/debian/prerm packaging/debian/postrm
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Regression tests
+        run: ./tests/run-tests.sh
 
   syntax:
     runs-on: ubuntu-latest

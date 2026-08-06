@@ -89,6 +89,79 @@ pass()  { record pass "$*"; PASSES=$(( PASSES + 1 ));   [ "$JSON" = 1 ] || ok "$
 flag()  { record warn "$*"; WARNINGS=$(( WARNINGS + 1 )); [ "$JSON" = 1 ] || warn "$*"; }
 fail()  { record fail "$*"; FAILURES=$(( FAILURES + 1 )); [ "$JSON" = 1 ] || err "$*"; }
 
+# A plain observation: true but not a verdict, and it must not move the exit
+# status. Used where a naive check would otherwise cry wolf.
+note()  { [ "$JSON" = 1 ] || log "  ${C_DIM}note${C_RESET}  $*"; }
+
+# --- log windows ------------------------------------------------------------
+#
+# Every log check below reads one of these snapshots, never the raw file. An
+# xrdp.log is append-only across months, so grepping it whole reports problems
+# that were fixed weeks ago as though they were happening now -- which trains
+# people to ignore the tool. A window is the lines written by the process that
+# is running *right now*.
+#
+# XRDP_WINDOW_STATE / SESMAN_WINDOW_STATE are one of:
+#   ok       -- scoped to the current service start, safe to draw conclusions
+#   unreadable -- the file exists but this user cannot read it (needs adm/root)
+#   missing  -- no such log
+#   unscoped -- readable, but the service start time is unknown, so the window
+#               is the whole file and its contents prove nothing about *now*
+
+KRK_TMP=$(mktemp -d 2>/dev/null) || KRK_TMP=""
+[ -n "$KRK_TMP" ] && trap 'rm -rf "$KRK_TMP"' EXIT INT TERM
+
+XRDP_WINDOW="$KRK_TMP/xrdp.window"
+SESMAN_WINDOW="$KRK_TMP/sesman.window"
+XRDP_WINDOW_STATE=missing
+SESMAN_WINDOW_STATE=missing
+XRDP_START=""
+
+open_window() {
+    local file=$1 unit=$2 out=$3 start
+    [ -n "$KRK_TMP" ] || { printf 'unscoped'; return; }
+    : >"$out"
+    if [ ! -e "$file" ]; then printf 'missing'; return; fi
+    if [ ! -r "$file" ]; then printf 'unreadable'; return; fi
+    start=$(krk_service_start_epoch "$unit" 2>/dev/null) || start=""
+    if [ -z "$start" ]; then
+        cat "$file" >"$out" 2>/dev/null
+        printf 'unscoped'
+        return
+    fi
+    krk_log_since "$file" "$start" >"$out" 2>/dev/null
+    printf '%s' "$start"
+}
+
+_w=$(open_window "$KRK_XRDP_LOG" xrdp "$XRDP_WINDOW")
+case $_w in
+    missing|unreadable|unscoped) XRDP_WINDOW_STATE=$_w ;;
+    *) XRDP_WINDOW_STATE=ok; XRDP_START=$_w ;;
+esac
+_w=$(open_window "$KRK_SESMAN_LOG" xrdp-sesman "$SESMAN_WINDOW")
+case $_w in
+    missing|unreadable|unscoped) SESMAN_WINDOW_STATE=$_w ;;
+    *) SESMAN_WINDOW_STATE=ok ;;
+esac
+
+# win_count WINDOW PATTERN -- occurrences inside a window, 0 when unusable.
+# grep exits 1 on no match, so the count has to be taken from its output alone.
+win_count() {
+    local w=$1 pat=$2 n
+    [ -s "$w" ] || { printf '0'; return; }
+    n=$(grep -acE -- "$pat" "$w" 2>/dev/null)
+    case ${n:-0} in ''|*[!0-9]*) printf '0' ;; *) printf '%s' "$n" ;; esac
+}
+
+# Human "3h 20m" for a duration in seconds.
+human_age() {
+    local s=$1
+    if   [ "$s" -lt 3600 ]  2>/dev/null; then printf '%dm' $(( s / 60 ))
+    elif [ "$s" -lt 172800 ] 2>/dev/null; then printf '%dh %dm' $(( s / 3600 )) $(( (s % 3600) / 60 ))
+    else printf '%dd %dh' $(( s / 86400 )) $(( (s % 86400) / 3600 ))
+    fi
+}
+
 if [ "$JSON" = 0 ]; then
     printf '%skali-rdp-doctor %s%s\n' "$C_BOLD" "$KRK_VERSION" "$C_RESET"
     [ "$(id -u)" -eq 0 ] || log "${C_DIM}(not root -- log and process checks will be partial)${C_RESET}"
@@ -200,36 +273,157 @@ else
     fail "$XRDP_INI not found"
 fi
 
-# xrdp drops to an unprivileged runtime_user, which must still be able to read
-# the TLS key. Debian ships the key as root:ssl-cert 0640, so xrdp has to be in
-# that group. When it is not, the handshake fails with an opaque
-# "xrdp_sec_incoming failed" and clients get disconnected at random.
+# --- 5. TLS: key readability, certificate, security layer -------------------
+
+step "5. TLS and security layer"
+
 key_path=$(ini_get "$XRDP_INI" Globals key_file)
 [ -n "$key_path" ] || key_path="$KRK_XRDP_DIR/key.pem"
+cert_path=$(ini_get "$XRDP_INI" Globals certificate)
+[ -n "$cert_path" ] || cert_path="$KRK_XRDP_DIR/cert.pem"
 runtime_user=$(ini_get "$XRDP_INI" Globals runtime_user)
 runtime_user=${runtime_user:-xrdp}
+sec_layer=$(ini_get "$XRDP_INI" Globals security_layer)
 
-if [ -e "$key_path" ] && id "$runtime_user" >/dev/null 2>&1; then
+# xrdp drops to an unprivileged runtime_user which must still read the TLS key.
+# Debian ships it as root:ssl-cert 0640, so xrdp has to be in that group.
+# Without it every handshake dies with an opaque "xrdp_sec_incoming failed".
+#
+# Two independent signals are needed, because either one alone lies:
+#   * a live read as runtime_user says what the permissions are *now*
+#   * the log window says what the *running* xrdp process actually experienced
+# They disagree in the case that matters most: `usermod -aG` takes effect for
+# new processes only, so right after the fix the permissions look perfect while
+# the xrdp still running from before the change cannot read a thing. Reporting
+# only the first gives a false all-clear; reporting only the second (which is
+# what this check used to do, against the whole log file) keeps failing forever
+# on an error from weeks ago.
+key_errors=$(win_count "$XRDP_WINDOW" 'Cannot read private key file')
+
+if ! krk_path_present "$key_path"; then
+    fail "TLS key $key_path does not exist -- xrdp cannot serve TLS at all"
+    fix "sudo make-ssl-cert generate-default-snakeoil --force-overwrite"
+    fix "then: sudo kali-rdp-setup"
+elif ! id "$runtime_user" >/dev/null 2>&1; then
+    fail "runtime_user '$runtime_user' from xrdp.ini does not exist"
+    fix "correct runtime_user in $XRDP_INI, or create the account"
+else
     real_key=$(readlink -f "$key_path" 2>/dev/null || printf '%s' "$key_path")
     key_group=$(stat -L -c '%G' "$key_path" 2>/dev/null)
-    if sudo -n -u "$runtime_user" test -r "$real_key" 2>/dev/null; then
-        pass "$runtime_user can read the TLS key"
-    elif [ -n "$key_group" ] && ! id -nG "$runtime_user" 2>/dev/null | tr ' ' '\n' | grep -qx "$key_group"; then
-        fail "$runtime_user is not in group '$key_group' -- cannot read $real_key"
-        fix "sudo usermod -aG $key_group $runtime_user && sudo systemctl restart xrdp"
-        fix "(or just: sudo kali-rdp-setup)"
-    else
-        log "  ${C_DIM}note${C_RESET}  could not verify TLS key readability as $runtime_user"
+    krk_can_read_as "$runtime_user" "$real_key"; readable=$?
+
+    case $readable in
+        0)
+            if [ "$key_errors" -gt 0 ]; then
+                fail "$runtime_user can read the key now, but the running xrdp logged $key_errors key-read failure(s) since it started"
+                fix "sudo systemctl restart xrdp   # the running process predates the permission fix"
+            else
+                pass "$runtime_user can read the TLS key"
+            fi ;;
+        1)
+            fail "$runtime_user cannot read $real_key -- every TLS handshake will fail"
+            if [ -n "$key_group" ] && ! id -nG "$runtime_user" 2>/dev/null | tr ' ' '\n' | grep -qx "$key_group"; then
+                fix "sudo usermod -aG $key_group $runtime_user && sudo systemctl restart xrdp"
+            else
+                fix "check the mode of $real_key and the execute bit on its parent directories"
+            fi
+            fix "(or just: sudo kali-rdp-setup)" ;;
+        *)
+            # Cannot impersonate runtime_user without root. Fall back to the
+            # evidence that is available, and say which one was used.
+            if [ "$key_errors" -gt 0 ]; then
+                fail "xrdp logged $key_errors key-read failure(s) since it started -- TLS handshakes are failing"
+                fix "sudo kali-rdp-setup   # adds $runtime_user to the key's group"
+            elif [ -n "$key_group" ] && ! id -nG "$runtime_user" 2>/dev/null | tr ' ' '\n' | grep -qx "$key_group"; then
+                fail "$runtime_user is not in group '$key_group' -- cannot read $real_key"
+                fix "sudo usermod -aG $key_group $runtime_user && sudo systemctl restart xrdp"
+            elif [ -n "$key_group" ]; then
+                pass "$runtime_user is in group '$key_group' and logged no key errors since xrdp started"
+                note "inferred from group membership -- run as root for a live read test"
+            else
+                # stat could not follow the symlink either: /etc/ssl/private is
+                # 0710. Both direct tests are unavailable, so the only evidence
+                # is that the running xrdp is not complaining. Say exactly that
+                # rather than dressing it up as a verified pass.
+                pass "no TLS key errors logged since xrdp started"
+                note "could not inspect $key_path as $(id -un); run as root to verify permissions directly"
+            fi ;;
+    esac
+fi
+
+# The whole-file history is worth one dim line and nothing more: it is how the
+# system used to be, not how it is.
+if [ "$key_errors" -eq 0 ] && [ "$XRDP_WINDOW_STATE" = ok ] \
+   && grep -qiE 'Cannot read private key file' "$KRK_XRDP_LOG" 2>/dev/null; then
+    note "xrdp.log contains older key-read failures, none since xrdp started -- already resolved"
+fi
+[ "$XRDP_WINDOW_STATE" = unreadable ] && \
+    note "$KRK_XRDP_LOG is not readable by $(id -un); log-based checks were skipped"
+[ "$XRDP_WINDOW_STATE" = unscoped ] && \
+    note "could not determine when xrdp started; log findings may predate the running process"
+
+# Certificate. An absent or expired cert breaks TLS outright; a self-signed one
+# is normal on Kali and is only a problem in combination with negotiate, below.
+self_signed=2
+if ! krk_path_present "$cert_path"; then
+    fail "TLS certificate $cert_path does not exist"
+    fix "sudo make-ssl-cert generate-default-snakeoil --force-overwrite"
+else
+    krk_cert_self_signed "$cert_path"; self_signed=$?
+    days_left=$(krk_cert_days_left "$cert_path" 2>/dev/null) || days_left=""
+    if [ -n "$days_left" ]; then
+        if [ "$days_left" -lt 0 ] 2>/dev/null; then
+            fail "TLS certificate expired $(( -days_left )) day(s) ago -- clients that validate will refuse"
+            fix "sudo make-ssl-cert generate-default-snakeoil --force-overwrite && sudo systemctl restart xrdp"
+        elif [ "$days_left" -lt 30 ] 2>/dev/null; then
+            flag "TLS certificate expires in $days_left day(s)"
+            fix "sudo make-ssl-cert generate-default-snakeoil --force-overwrite"
+        else
+            pass "TLS certificate valid for $days_left more day(s)"
+        fi
     fi
 fi
-if grep -qiE 'Cannot read private key file' /var/log/xrdp.log 2>/dev/null; then
-    fail "xrdp.log reports it cannot read the private key -- TLS handshakes fail"
-    fix "sudo kali-rdp-setup   # adds $runtime_user to the key's group"
-fi
 
-# --- 5. disconnected-session policy ----------------------------------------
+# The security layer itself. This is the one that produced hours of black
+# screens: with `negotiate` the client chooses between RDP security, TLS and
+# CredSSP, and clients presented with an untrusted self-signed certificate can
+# fail or flip-flop on that choice, most visibly on reconnect. Pinning `tls`
+# removes the choice, and the handshake stops being intermittent.
+case ${sec_layer:-negotiate} in
+    tls)
+        pass "security_layer=tls -- the handshake is not left to client negotiation" ;;
+    rdp)
+        flag "security_layer=rdp -- legacy RDP security, the session is not TLS protected"
+        fix "sudo kali-rdp-setup --security-layer tls" ;;
+    negotiate|"")
+        if [ "$self_signed" -eq 0 ]; then
+            flag "security_layer=${sec_layer:-negotiate} with a self-signed certificate -- a known cause of intermittent handshake failures and black screens on reconnect"
+            fix "sudo kali-rdp-setup --security-layer tls"
+        else
+            pass "security_layer=${sec_layer:-negotiate} with a CA-signed certificate"
+            note "pinning security_layer=tls is still more deterministic across clients"
+        fi ;;
+    *)
+        flag "security_layer=$sec_layer is not a value xrdp recognises (tls|rdp|negotiate)"
+        fix "sudo kali-rdp-setup --security-layer tls" ;;
+esac
 
-step "5. Disconnected session policy"
+crypt=$(ini_get "$XRDP_INI" Globals crypt_level)
+case ${crypt:-high} in
+    none|low) flag "crypt_level=$crypt is weak"
+              fix "set crypt_level=high in $XRDP_INI" ;;
+esac
+
+protos=$(ini_get "$XRDP_INI" Globals ssl_protocols)
+case $protos in
+    *TLSv1.0*|*TLSv1.1*)
+        flag "ssl_protocols offers $protos -- TLS 1.0/1.1 are deprecated and refused by current clients"
+        fix "set ssl_protocols=TLSv1.2, TLSv1.3 in $XRDP_INI" ;;
+esac
+
+# --- 6. disconnected-session policy ----------------------------------------
+
+step "6. Disconnected session policy"
 
 if [ -f "$SESMAN_INI" ]; then
     kd=$(ini_get "$SESMAN_INI" Sessions KillDisconnected)
@@ -306,34 +500,91 @@ else
     fail "$SESMAN_INI not found"
 fi
 
-# --- 6. live sessions and orphans ------------------------------------------
+# --- 7. live sessions and orphans ------------------------------------------
 
-step "6. Live sessions"
+step "7. Live sessions"
 
-sessions=$(krk_xvnc_sessions)
+inventory=$(krk_xvnc_inventory)
 parked=0
-if [ -z "$sessions" ]; then
+orphans=0
+depths=""
+sesman_pid=$(krk_sesman_pid) || sesman_pid=""
+
+if [ -z "$inventory" ]; then
     log "  no Xvnc sessions running"
 else
-    live_displays=""
-    while read -r pid display; do
+    while IFS=$'\t' read -r pid display depth geom kind; do
         [ -n "${pid:-}" ] || continue
         cpu=$(ps -o %cpu= -p "$pid" 2>/dev/null | tr -d ' ')
         et=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
+        owner=$(krk_pid_user "$pid")
+        desc=":$display  pid $pid  ${owner:-?}  $geom@${depth}bpp  up $et  cpu ${cpu}%"
+
+        # A desktop the user started with vncserver(1) is not xrdp's, and must
+        # never be judged by xrdp's rules -- flagging it as an orphan would
+        # invite somebody to kill their own long-running work.
+        if [ "$kind" != "sesman" ]; then
+            note "$desc  -- standalone Xvnc, not an xrdp session (left alone)"
+            continue
+        fi
+
+        # The failure the reporter hit: sesman keeps its session table in
+        # memory, so restarting it (which `kali-rdp-setup` used to do on every
+        # run, and which any xrdp restart triggers through BindsTo) forgets
+        # every desktop while the Xvnc processes carry on. The desktop is still
+        # there with the user's work in it, still holding its VNC port, and no
+        # client can ever reach it again -- reconnecting quietly builds a new
+        # empty one instead. This is what "I reconnected and my apps were gone"
+        # and "it would not connect at all" both look like from the outside.
+        if krk_session_orphaned "$pid"; then
+            orphans=$(( orphans + 1 ))
+            if [ -n "$sesman_pid" ]; then
+                fail "$desc  -- UNREACHABLE: sesman no longer tracks it, no client can rejoin"
+            else
+                fail "$desc  -- UNREACHABLE: xrdp-sesman is not running"
+            fi
+            continue
+        fi
+
+        depths="$depths $depth"
         if krk_display_connected "$display"; then
-            pass ":$display  pid $pid  up $et  cpu ${cpu}%  -- client attached"
-            live_displays="$live_displays $display"
+            pass "$desc  -- client attached"
         else
             # Not a fault: a parked desktop is somebody's work waiting to be
             # reconnected to, and keeping it is the whole point of the default.
-            pass ":$display  pid $pid  up $et  cpu ${cpu}%  -- parked, applications still running"
+            pass "$desc  -- parked, applications still running"
             parked=$(( parked + 1 ))
         fi
-        # Runaway CPU on an X server is the classic orphan signature.
+        # Runaway CPU on an X server is the classic spinning-orphan signature.
         if [ -n "$cpu" ] && [ "${cpu%%.*}" -ge 80 ] 2>/dev/null; then
             fail ":$display is burning ${cpu}% CPU -- likely a spinning orphan"
         fi
-    done <<<"$sessions"
+    done <<<"$inventory"
+
+    if [ "$orphans" -gt 0 ]; then
+        fix "sudo kali-rdp-cleanup --orphans --dry-run   # see exactly what would go"
+        fix "sudo kali-rdp-cleanup --orphans             # free the ports and the RAM"
+        fix "their contents cannot be recovered -- the X server has no client path left"
+    fi
+
+    # Reaching one desktop from a laptop, a phone and a tablet only works when
+    # every client lands on the same session. xrdp keys sessions on colour
+    # depth (the B in Policy=UB) and that criterion cannot be switched off, so
+    # one client negotiating 32bpp and another 16bpp get two separate desktops
+    # for the same user -- the single most confusing thing about multi-device
+    # RDP, because nothing anywhere reports it as an error.
+    uniq_depths=$(printf '%s\n' $depths | sort -u | tr '\n' ' ')
+    n_depths=$(printf '%s\n' $depths | sort -u | grep -c .)
+    if [ "${n_depths:-0}" -gt 1 ]; then
+        flag "desktops exist at several colour depths (${uniq_depths% }) -- clients cannot share one session across them"
+        fix "sudo kali-rdp-setup --max-bpp 16   # makes every client converge on one desktop"
+    elif [ -n "$depths" ]; then
+        cap=$(ini_get "$XRDP_INI" Globals max_bpp)
+        if [ -z "$cap" ] || [ "$cap" -gt 16 ] 2>/dev/null; then
+            note "max_bpp=${cap:-unset}: a phone or tablet negotiating a lower depth will get its own separate desktop"
+            note "      sudo kali-rdp-setup --max-bpp 16   converges them onto one"
+        fi
+    fi
 
     # The honest cost of persistent desktops: nothing closes them, so a client
     # that keeps starting new sessions instead of rejoining will accumulate
@@ -345,7 +596,24 @@ else
     fi
 fi
 
-step "7. Screen lockers"
+# Session churn. A desktop that has simply been idle for a day is healthy; one
+# that has sat through twenty reconnect attempts in the last hour is a symptom.
+# Nothing in the per-session output can tell those apart, so measure the rate at
+# which sesman has been building desktops rather than the age of any one of them.
+if [ "$SESMAN_WINDOW_STATE" = ok ] || [ "$SESMAN_WINDOW_STATE" = unscoped ]; then
+    hour_ago=$(( $(date +%s) - 3600 ))
+    recent=$(krk_log_since "$KRK_SESMAN_LOG" "$hour_ago" 2>/dev/null \
+             | grep -cE 'X server :[0-9]+ is working' 2>/dev/null) || recent=0
+    if [ "${recent:-0}" -ge 5 ]; then
+        flag "$recent desktops were created in the last hour -- clients are starting new sessions instead of rejoining"
+        fix "sudo kali-rdp-setup --max-bpp 16   # the usual cause is mismatched colour depth"
+        fix "sudo kali-rdp-cleanup --orphans    # clear untracked desktops left by the churn"
+    elif [ "${recent:-0}" -gt 0 ]; then
+        note "$recent desktop(s) created in the last hour"
+    fi
+fi
+
+step "8. Screen lockers"
 
 # The failure this catches: reconnect after hours away, land on a lock prompt,
 # and discover the unlock dialog cannot take keyboard focus under Xvnc. The RDP
@@ -377,7 +645,7 @@ else
     pass "no screen locker will autostart"
 fi
 
-step "8. Orphaned helper processes"
+step "9. Orphaned helper processes"
 
 orphan_total=0
 count_orphans() {
@@ -386,10 +654,10 @@ count_orphans() {
         d=$(krk_proc_env "$pid" DISPLAY); d=${d#:}; d=${d%%.*}
         if [ -z "$d" ]; then
             [ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" = "1" ] \
-                && [ -z "$sessions" ] && n=$(( n + 1 ))
+                && [ -z "$inventory" ] && n=$(( n + 1 ))
             continue
         fi
-        printf '%s' " $(echo "$sessions" | awk '{print $2}' | tr '\n' ' ') " \
+        printf '%s' " $(printf '%s\n' "$inventory" | cut -f2 | tr '\n' ' ') " \
             | grep -q " $d " || n=$(( n + 1 ))
     done
     if [ "$n" -gt 0 ]; then
@@ -416,27 +684,96 @@ else
     fix "sudo systemctl enable --now kali-rdp-cleanup.timer"
 fi
 
-# --- 8. logs ----------------------------------------------------------------
+# --- 10. logs ---------------------------------------------------------------
 
-step "9. Recent errors in xrdp logs"
+step "10. Errors since the services started"
 
-log_hits=0
-for f in /var/log/xrdp-sesman.log /var/log/xrdp.log; do
-    [ -r "$f" ] || continue
-    hits=$(grep -iE '\[ERROR\]|\[WARN\]' "$f" 2>/dev/null | tail -5)
-    if [ -n "$hits" ]; then
-        # In JSON mode nothing but the document may reach stdout, so record the
-        # count as a check instead of dumping the excerpt.
-        if [ "$JSON" = 1 ]; then
-            flag "$(printf '%s' "$hits" | wc -l) recent error/warning line(s) in $f"
-        else
-            log "  ${C_DIM}$f${C_RESET}"
-            printf '%s\n' "$hits" | sed 's/^/    /'
-        fi
-        log_hits=1
+# Everything here reads the scoped windows, and every signature is classified
+# before it is shown. Two rules earn their keep:
+#
+#   * xrdp logs routine events at ERROR level. `g_tcp_bind ... errno=98` is how
+#     sesman *probes* for a free display -- the very next line is "Found X
+#     server running at ...". Dumping it as an error sends people hunting for a
+#     network fault that does not exist.
+#   * a failed handshake is only alarming in the absence of successful ones. A
+#     phone that loses signal mid-connect, or anything scanning the port, logs
+#     exactly the same lines as a genuinely broken server.
+#
+# So the digest counts successes alongside failures and grades on the ratio.
+
+report_window_state() {
+    local state=$1 name=$2
+    case $state in
+        missing)    note "$name does not exist" ;;
+        unreadable) note "$name is not readable by $(id -un) -- add yourself to the adm group, or run with sudo" ;;
+        unscoped)   note "$name could not be scoped to a service start; showing its whole history" ;;
+    esac
+}
+report_window_state "$XRDP_WINDOW_STATE"   "$KRK_XRDP_LOG"
+report_window_state "$SESMAN_WINDOW_STATE" "$KRK_SESMAN_LOG"
+
+if [ "$XRDP_WINDOW_STATE" = ok ] && [ -n "$XRDP_START" ]; then
+    note "window: since xrdp started $(human_age $(( $(date +%s) - XRDP_START ))) ago"
+fi
+
+logins_ok=$(win_count "$XRDP_WINDOW" 'login was successful')
+handshake_fail=$(win_count "$XRDP_WINDOW" 'xrdp_sec_incoming: xrdp_mcs_incoming failed')
+early_close=$(win_count "$XRDP_WINDOW" 'libxrdp_force_read: header read error')
+ssl_noise=$(win_count "$XRDP_WINDOW" 'SSL_shutdown|application data after close notify|SSL_read: I/O error')
+vnc_closed=$(win_count "$XRDP_WINDOW" 'VNC server closed connection')
+auth_fail=$(win_count "$XRDP_WINDOW" 'login failed|Access denied')
+bind_probe=$(win_count "$SESMAN_WINDOW" 'g_tcp_bind')
+sesman_refused=$(win_count "$XRDP_WINDOW" 'sesman connect .* failed|Error connecting to sesman')
+
+if [ "$handshake_fail" -gt 0 ]; then
+    if [ "$logins_ok" -eq 0 ]; then
+        fail "$handshake_fail handshake failure(s) and NO successful login since xrdp started -- nothing can connect"
+        [ "${sec_layer:-negotiate}" = negotiate ] && \
+            fix "sudo kali-rdp-setup --security-layer tls   # negotiation against a self-signed cert is the usual cause"
+        fix "sudo journalctl -u xrdp -n 50"
+    else
+        note "$handshake_fail handshake failure(s) against $logins_ok successful login(s)"
+        note "      clients that vanish mid-connect (a phone changing network, a port"
+        note "      scanner) log exactly this; it only matters if logins are also failing"
     fi
-done
-[ "$log_hits" -eq 0 ] && pass "no recent errors or warnings in xrdp logs"
+elif [ "$logins_ok" -gt 0 ]; then
+    pass "$logins_ok successful login(s) and no handshake failures since xrdp started"
+fi
+
+if [ "$sesman_refused" -gt 0 ]; then
+    fail "$sesman_refused failed connection(s) from xrdp to sesman -- the login box will accept a password and then hang"
+    fix "sudo systemctl restart xrdp-sesman && kali-rdp-doctor"
+fi
+
+if [ "$auth_fail" -gt 0 ]; then
+    port=$(ini_get "$XRDP_INI" Globals port)
+    flag "$auth_fail rejected login attempt(s) since xrdp started"
+    fix "if this host's port ${port:-3389} is reachable from the internet, put it behind a VPN or SSH tunnel"
+fi
+
+[ "$early_close" -gt 0 ] && \
+    note "$early_close connection(s) closed by the peer before the handshake finished (scanners and dropped mobile links look like this)"
+[ "$ssl_noise" -gt 0 ] && \
+    note "$ssl_noise TLS teardown error(s) -- a client that disappeared without closing cleanly, not a server fault"
+[ "$vnc_closed" -gt 0 ] && \
+    note "$vnc_closed session(s) ended because their X server exited"
+[ "$bind_probe" -gt 0 ] && \
+    note "$bind_probe display-slot probe(s) in sesman.log (logged at ERROR level, but this is how a free display is found)"
+
+# Anything unrecognised still deserves to be seen; showing the tail of it is
+# what makes this a diagnostic rather than a scorecard.
+if [ "$JSON" = 0 ]; then
+    for f in "$XRDP_WINDOW" "$SESMAN_WINDOW"; do
+        [ -s "$f" ] || continue
+        case $f in *xrdp.window) name=$KRK_XRDP_LOG ;; *) name=$KRK_SESMAN_LOG ;; esac
+        hits=$(grep -aE '\[ERROR\]' "$f" 2>/dev/null \
+               | grep -avE 'g_tcp_bind|SSL_shutdown|application data after close notify|SSL_read: I/O error|libxrdp_force_read|xrdp_mcs_incoming failed|xrdp_sec_incoming failed|libxrdp_process_incoming failed|trans_write_copy_s|DisconnectProviderUltimatum|Connect-Initial failed|receive connection request failed' \
+               | tail -5)
+        [ -n "$hits" ] || continue
+        log "  ${C_DIM}unclassified errors in $name${C_RESET}"
+        printf '%s\n' "$hits" | sed 's/^/    /'
+    done
+fi
 
 # --- summary ----------------------------------------------------------------
 
@@ -453,17 +790,28 @@ if [ "$JSON" = 1 ]; then
     printf '  "status": "%s",\n' "$overall"
     printf '  "counts": {"pass": %d, "warn": %d, "fail": %d},\n' \
         "$PASSES" "$WARNINGS" "$FAILURES"
+    # The TLS posture is the thing a fleet dashboard wants to alert on before a
+    # user ever notices, so it is a first-class field rather than prose.
+    printf '  "tls": {"security_layer": "%s", "self_signed": %s, "cert_days_left": %s},\n' \
+        "$(json_escape "${sec_layer:-negotiate}")" \
+        "$([ "${self_signed:-2}" -eq 0 ] && echo true || { [ "${self_signed:-2}" -eq 1 ] && echo false || echo null; })" \
+        "${days_left:-null}"
+    printf '  "log_window": {"xrdp": "%s", "sesman": "%s", "successful_logins": %s, "handshake_failures": %s},\n' \
+        "$XRDP_WINDOW_STATE" "$SESMAN_WINDOW_STATE" "${logins_ok:-0}" "${handshake_fail:-0}"
     printf '  "sessions": ['
     sep=""
-    while read -r spid sdisp; do
+    while IFS=$'\t' read -r spid sdisp sdepth sgeom skind; do
         [ -n "${spid:-}" ] || continue
         conn=false; krk_display_connected "$sdisp" && conn=true
+        orph=false; [ "$skind" = sesman ] && krk_session_orphaned "$spid" && orph=true
         scpu=$(ps -o %cpu= -p "$spid" 2>/dev/null | tr -d ' ')
         setime=$(ps -o etimes= -p "$spid" 2>/dev/null | tr -d ' ')
-        printf '%s\n    {"display": %s, "pid": %s, "connected": %s, "cpu_percent": %s, "uptime_seconds": %s}' \
-            "$sep" "$sdisp" "$spid" "$conn" "${scpu:-0}" "${setime:-0}"
+        printf '%s\n    {"display": %s, "pid": %s, "owner": "%s", "kind": "%s", "depth": %s, "geometry": "%s", "connected": %s, "orphaned": %s, "cpu_percent": %s, "uptime_seconds": %s}' \
+            "$sep" "$sdisp" "$spid" "$(json_escape "$(krk_pid_user "$spid")")" \
+            "$skind" "$([ "$sdepth" = "?" ] && echo null || echo "$sdepth")" \
+            "$(json_escape "$sgeom")" "$conn" "$orph" "${scpu:-0}" "${setime:-0}"
         sep=","
-    done <<<"$(krk_xvnc_sessions)"
+    done <<<"$inventory"
     [ -n "$sep" ] && printf '\n  '
     printf '],\n'
     printf '  "checks": [\n'

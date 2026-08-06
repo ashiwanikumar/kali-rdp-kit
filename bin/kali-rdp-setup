@@ -16,9 +16,12 @@ KRK_DRY_RUN=0
 KEEP_DM=0
 NO_TMUX=0
 NO_TIMER=0
+NO_RESTART=0
+ASSUME_YES=0
 REAP_DISCONNECTED=""
 RDP_PORT=""
 MAX_BPP=""
+SECURITY_LAYER=""
 CHANGED=0
 
 usage() {
@@ -44,10 +47,19 @@ Options:
                            on colour depth, so a phone negotiating a different
                            depth than your desktop gets a SEPARATE desktop.
                            Capping low makes every client converge on one.
+      --security-layer L   tls | negotiate | rdp. Defaults to tls, because
+                           Kali ships a self-signed certificate and letting
+                           clients negotiate against one causes intermittent
+                           handshake failures and black screens on reconnect.
       --reap-disconnected S close desktops left disconnected for S seconds.
                            Off by default -- this CLOSES USERS' APPLICATIONS.
       --no-tmux            skip the tmux config
       --no-timer           skip the cleanup systemd timer
+      --no-restart         apply the changes but do not restart xrdp. Restarting
+                           makes sesman forget every running desktop, so use this
+                           when someone is working in one.
+  -y, --yes                do not prompt, even when a restart would orphan a
+                           running desktop
   -h, --help               this message
 EOF
 }
@@ -66,8 +78,15 @@ while [ $# -gt 0 ]; do
                              case $REAP_DISCONNECTED in
                                  ''|*[!0-9]*) die "--reap-disconnected needs a number of seconds" ;;
                              esac ;;
+        --security-layer)    SECURITY_LAYER=${2:?--security-layer needs a value}; shift
+                             case $SECURITY_LAYER in
+                                 tls|negotiate|rdp) ;;
+                                 *) die "--security-layer must be tls, negotiate or rdp" ;;
+                             esac ;;
         --no-tmux)           NO_TMUX=1 ;;
         --no-timer)          NO_TIMER=1 ;;
+        --no-restart)        NO_RESTART=1 ;;
+        -y|--yes)            ASSUME_YES=1 ;;
         -h|--help)           usage; exit 0 ;;
         *)                   err "unknown option: $1"; usage >&2; exit 2 ;;
     esac
@@ -241,15 +260,121 @@ key_path=$(ini_get "$XRDP_INI" Globals key_file)
 runtime_user=$(ini_get "$XRDP_INI" Globals runtime_user)
 runtime_user=${runtime_user:-xrdp}
 
-if [ -e "$key_path" ] && id "$runtime_user" >/dev/null 2>&1; then
+key_group_fixed=0
+key_group=""
+if krk_path_present "$key_path" && id "$runtime_user" >/dev/null 2>&1; then
     key_group=$(stat -L -c '%G' "$key_path" 2>/dev/null)
     if [ -n "$key_group" ] && [ "$key_group" != "root" ] \
        && ! id -nG "$runtime_user" 2>/dev/null | tr ' ' '\n' | grep -qx "$key_group"; then
         info "adding $runtime_user to group $key_group so it can read the TLS key"
         run usermod -aG "$key_group" "$runtime_user"
+        # Group membership only applies to processes started afterwards, so the
+        # xrdp running right now still cannot read the key. The restart at the
+        # end of this run is what actually completes the fix.
+        key_group_fixed=1
+        note_change
+    elif [ -n "$key_group" ]; then
+        ok "$runtime_user can reach the TLS key (group $key_group)"
+    else
+        ok "TLS key present at $key_path"
+    fi
+fi
+
+# --- security layer ---------------------------------------------------------
+#
+# Kali ships xrdp with security_layer=negotiate and a self-signed snakeoil
+# certificate. With `negotiate` the client picks between RDP security, TLS and
+# CredSSP; presented with a certificate it cannot validate, some clients --
+# mstsc most visibly -- fail or flip-flop on that choice, and most often on a
+# reconnect after a previous session was left in a stale state. The connection
+# dies before a window manager ever starts, so the user sees a black screen and
+# a drop, and the server logs only "xrdp_sec_incoming failed", which says
+# nothing about the cause. Pinning `tls` removes the choice and the flakiness
+# with it. This is why the default here differs from Kali's shipped default.
+#
+# The one thing that must never happen is pinning tls on a host with no usable
+# certificate: that turns an intermittently failing server into a permanently
+# failing one. So the cert and key are verified first, and a missing pair
+# downgrades the change to advice rather than applying it.
+cert_path=$(ini_get "$XRDP_INI" Globals certificate)
+[ -n "$cert_path" ] || cert_path="$KRK_XRDP_DIR/cert.pem"
+current_layer=$(ini_get "$XRDP_INI" Globals security_layer)
+want_layer=${SECURITY_LAYER:-tls}
+
+# Pinning tls on a host whose key xrdp cannot read would turn an intermittent
+# fault into a permanent one, so the change is gated on the key being usable.
+# The gate has to be careful in both directions: refusing to apply the fix
+# because the *test* was inconclusive is its own failure mode.
+tls_usable=1
+if ! krk_path_present "$cert_path" || ! krk_path_present "$key_path"; then
+    tls_usable=0
+    warn "TLS certificate or key missing ($cert_path / $key_path)"
+    warn "generate them first, then re-run this:"
+    warn "  sudo make-ssl-cert generate-default-snakeoil --force-overwrite"
+else
+    key_real=$(readlink -f "$key_path" 2>/dev/null || printf '%s' "$key_path")
+    krk_can_read_as "$runtime_user" "$key_real"
+    case $? in
+        0) ;;                       # verified readable
+        1) if [ "$key_group_fixed" = 1 ] || [ "$KRK_DRY_RUN" = 1 ]; then
+               # Expected: the group was added moments ago and takes effect at
+               # the restart that ends this run.
+               :
+           else
+               tls_usable=0
+               warn "$runtime_user cannot read the TLS key; not forcing security_layer=tls"
+               warn "fix the key permissions first, or TLS would fail for every client"
+           fi ;;
+        *) # Could not impersonate runtime_user at all. Fall back to group
+           # membership, which is the condition the read test would have been
+           # measuring anyway.
+           if [ -z "$key_group" ] \
+              || id -nG "$runtime_user" 2>/dev/null | tr ' ' '\n' | grep -qx "$key_group" \
+              || [ "$key_group_fixed" = 1 ]; then
+               warn "could not verify the key read as $runtime_user; proceeding on group membership"
+           else
+               tls_usable=0
+               warn "could not verify the key read as $runtime_user, and it is not in group '$key_group'"
+               warn "not forcing security_layer=tls"
+           fi ;;
+    esac
+fi
+
+if [ "$want_layer" = tls ] && [ "$tls_usable" = 0 ]; then
+    warn "leaving security_layer=${current_layer:-negotiate} until TLS is usable"
+elif [ -n "$SECURITY_LAYER" ] || [ "${current_layer:-negotiate}" != tls ]; then
+    if [ "$want_layer" != tls ] && [ "$want_layer" != "$current_layer" ]; then
+        warn "security_layer=$want_layer was requested explicitly"
+        [ "$want_layer" = rdp ] && warn "  rdp is legacy, unencrypted RDP security"
+        [ "$want_layer" = negotiate ] && \
+            warn "  with a self-signed certificate this is a known source of intermittent handshake failures"
+    fi
+    if ini_set "$XRDP_INI" Globals security_layer "$want_layer"; then
+        info "security_layer=$want_layer (was ${current_layer:-unset, i.e. negotiate})"
         note_change
     else
-        ok "$runtime_user can reach the TLS key (group $key_group)"
+        ok "security_layer already $want_layer"
+    fi
+else
+    ok "security_layer already tls"
+fi
+
+# TLS 1.0/1.1 are refused outright by current clients; offering them cannot
+# help and reads as a misconfiguration to anyone auditing the host.
+protos=$(ini_get "$XRDP_INI" Globals ssl_protocols)
+case $protos in
+    *TLSv1.0*|*TLSv1.1*)
+        if ini_set "$XRDP_INI" Globals ssl_protocols "TLSv1.2, TLSv1.3"; then
+            info "ssl_protocols=TLSv1.2, TLSv1.3 (was $protos)"; note_change
+        fi ;;
+    *) ok "ssl_protocols=${protos:-default}" ;;
+esac
+
+if krk_path_present "$cert_path"; then
+    days_left=$(krk_cert_days_left "$cert_path" 2>/dev/null) || days_left=""
+    if [ -n "$days_left" ] && [ "$days_left" -lt 0 ] 2>/dev/null; then
+        warn "the TLS certificate expired $(( -days_left )) day(s) ago"
+        warn "  sudo make-ssl-cert generate-default-snakeoil --force-overwrite"
     fi
 fi
 
@@ -362,13 +487,93 @@ fi
 
 step "7. Restart services"
 
+# Restarting is not free, and the cost is not the few seconds of downtime.
+#
+# sesman holds its session table in memory. Stopping it forgets every desktop,
+# while the Xvnc processes themselves survive -- they run in a logind session
+# scope rather than the unit's cgroup, so systemd does not take them down. What
+# is left is a desktop that is still running, still holding VNC port
+# 5900+display, and that no client can ever rejoin: reconnecting builds a new
+# empty one beside it. That is the whole of "my session disconnected and then I
+# could not get back in".
+#
+# There is no way to restart xrdp without taking sesman with it -- sesman is
+# BindsTo=xrdp.service -- so the only honest options are to say what will be
+# lost, or not to restart. Both are offered here.
+inventory_snapshot=$(krk_xvnc_inventory)
+live_desktops=$(printf '%s' "$inventory_snapshot" | awk -F'\t' '$5 == "sesman" { print $2 }')
+n_live=$(printf '%s' "$live_desktops" | grep -c . || true)
+
 if [ "$CHANGED" -eq 0 ]; then
     ok "nothing changed; not restarting xrdp"
+elif [ "$NO_RESTART" = 1 ]; then
+    warn "--no-restart given; the changes are on disk but not yet in effect"
+    warn "apply them when nobody is working in a desktop:"
+    warn "  sudo systemctl restart xrdp"
 else
-    info "restarting xrdp and xrdp-sesman"
-    run systemctl enable xrdp xrdp-sesman >/dev/null 2>&1
-    run systemctl restart xrdp-sesman
-    run systemctl restart xrdp
+    # The warning is worth just as much on a dry run -- more, even: reviewing
+    # what a run would cost is exactly what --dry-run is for.
+    if [ "${n_live:-0}" -gt 0 ]; then
+        warn "restarting will make sesman forget ${n_live} running desktop(s):"
+        for _d in $live_desktops; do
+            _who=$(printf '%s' "$inventory_snapshot" | awk -F'\t' -v d="$_d" '$2 == d { print $1 }')
+            warn "    :$_d  (owner $(krk_pid_user "$_who"))"
+        done
+        warn "they keep running and their applications are not killed, but no client"
+        warn "can rejoin them afterwards -- reconnecting will build a new empty desktop"
+        warn "log out of them first, or re-run with --no-restart to apply this later"
+    fi
+
+    if [ "${n_live:-0}" -gt 0 ] && [ "$KRK_DRY_RUN" != 1 ]; then
+        if [ "$ASSUME_YES" != 1 ] && [ -t 0 ]; then
+            printf '  restart anyway? [y/N] '
+            read -r _reply
+            case $_reply in
+                y|Y|yes|YES) ;;
+                *) warn "not restarting; the changes are on disk"
+                   warn "apply them later with: sudo systemctl restart xrdp"
+                   NO_RESTART=1 ;;
+            esac
+        elif [ "$ASSUME_YES" != 1 ]; then
+            # Non-interactive and desktops are live: refusing is the only safe
+            # default. A cron job or a piped installer must not silently strand
+            # somebody's work.
+            warn "no terminal to confirm on; not restarting"
+            warn "re-run with --yes to restart anyway, or --no-restart to silence this"
+            NO_RESTART=1
+        fi
+    fi
+
+    if [ "$NO_RESTART" != 1 ]; then
+        info "restarting xrdp and xrdp-sesman"
+        run systemctl enable xrdp xrdp-sesman >/dev/null 2>&1
+        run systemctl restart xrdp-sesman
+        run systemctl restart xrdp
+    fi
+fi
+
+# A restart that failed leaves a host with no RDP at all, and the exit status
+# of `systemctl restart` does not always catch it. Check what actually happened.
+if [ "$KRK_DRY_RUN" != 1 ] && [ "$CHANGED" -gt 0 ] && [ "$NO_RESTART" != 1 ]; then
+    if ! systemctl is-active --quiet xrdp; then
+        err "xrdp is not running after the restart"
+        log "  sudo journalctl -u xrdp -n 50 --no-pager"
+        exit 1
+    fi
+    listen_port=$(ini_get "$XRDP_INI" Globals port)
+    listen_port=${listen_port:-3389}
+    # The listener can take a moment to bind after the unit reports active.
+    for _ in 1 2 3 4 5; do
+        ss -tlnH 2>/dev/null | grep -q ":$listen_port " && break
+        sleep 1
+    done
+    if ss -tlnH 2>/dev/null | grep -q ":$listen_port "; then
+        ok "xrdp is listening on port $listen_port"
+    else
+        err "xrdp is running but nothing is listening on port $listen_port"
+        log "  sudo journalctl -u xrdp -n 50 --no-pager"
+        exit 1
+    fi
 fi
 
 echo

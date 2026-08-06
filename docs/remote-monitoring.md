@@ -122,11 +122,55 @@ Two ways to handle it:
 Check for accumulated desktops any time:
 
 ```bash
-kali-rdp-doctor          # section 6 lists every session and whether it is attached
+kali-rdp-doctor          # section 7 lists every session, its depth, and its state
 ```
 
 Several sessions for one user means the extras hold windows you thought you had
 lost. Reconnect at the matching depth to get back into one.
+
+### The other reason a reconnect lands somewhere new
+
+`xrdp-sesman` keeps its list of running desktops **in memory only**. Restart it
+— or restart `xrdp`, which takes sesman with it, or run anything that does, such
+as an older `kali-rdp-setup` — and that list is gone. The `Xvnc` processes are
+not: they live in a logind session scope rather than the service's cgroup, so
+systemd leaves them alone.
+
+What you get is a desktop that is still running, still holding its VNC port,
+with your applications alive inside it, that no client can ever rejoin.
+Reconnecting quietly builds a new empty desktop beside it. From the phone this
+looks like "I reconnected and everything I had open is gone"; if enough of them
+pile up it eventually looks like "it won't connect at all".
+
+```bash
+kali-rdp-doctor                      # reports each one as UNREACHABLE
+sudo kali-rdp-cleanup --orphans -n   # preview
+sudo kali-rdp-cleanup --orphans      # free the ports and the RAM
+```
+
+Their contents cannot be recovered — there is no client path left into an X
+server sesman has forgotten. This is the strongest practical argument for the
+split below: a job inside `tmux` does not care that its desktop became
+unreachable, because it was never inside the desktop to begin with.
+
+`kali-rdp-setup` now names the desktops a restart would strand and asks before
+restarting, so applying configuration changes no longer silently costs you a
+session.
+
+### Reconnects that fail before you see anything
+
+If the client connects and drops on a black screen, before any desktop appears,
+and `/var/log/xrdp.log` shows `xrdp_sec_incoming: xrdp_mcs_incoming failed`,
+the handshake is being lost to security negotiation rather than to anything
+about your session. Kali ships `security_layer=negotiate` with a self-signed
+certificate; some clients handle that combination inconsistently, most visibly
+on a reconnect.
+
+```bash
+sudo kali-rdp-setup --security-layer tls
+```
+
+`kali-rdp-doctor` flags the combination in section 5 before it bites you.
 
 ---
 

@@ -21,6 +21,9 @@ KRK_LIB="${KRK_LIB:-/usr/lib/kali-rdp-kit}"
 GRACE_SECONDS=${KRK_GRACE_SECONDS:-never}
 KRK_DRY_RUN=0
 VERBOSE=0
+REAP_ORPHANS=0
+KILL_DISPLAY=""
+ASSUME_YES=0
 SEEN_FILE=""
 
 usage() {
@@ -38,6 +41,12 @@ Options:
   -n, --dry-run          report what would be killed, change nothing
   -g, --grace SECONDS    also reap desktops left disconnected this long.
                          "never" (the default) keeps them indefinitely.
+      --orphans          also reap desktops that sesman no longer tracks. These
+                         cannot be reconnected to by any client -- they only
+                         hold RAM and their VNC port. Reported, never reaped,
+                         unless you pass this.
+      --kill DISPLAY     reap one specific desktop (e.g. --kill 18, or :18)
+  -y, --yes              do not prompt before killing a desktop in use
   -v, --verbose          also report sessions that were left alone
   -h, --help             this message
 
@@ -49,6 +58,13 @@ while [ $# -gt 0 ]; do
     case $1 in
         -n|--dry-run) KRK_DRY_RUN=1 ;;
         -g|--grace)   GRACE_SECONDS=${2:?--grace needs a value}; shift ;;
+        --orphans)    REAP_ORPHANS=1 ;;
+        --kill)       KILL_DISPLAY=${2:?--kill needs a display number}; shift
+                      KILL_DISPLAY=${KILL_DISPLAY#:}
+                      case $KILL_DISPLAY in
+                          ''|*[!0-9]*) die "--kill needs a display number (e.g. 18)" ;;
+                      esac ;;
+        -y|--yes)     ASSUME_YES=1 ;;
         -v|--verbose) VERBOSE=1 ;;
         -h|--help)    usage; exit 0 ;;
         *)            err "unknown option: $1"; usage >&2; exit 2 ;;
@@ -124,10 +140,88 @@ reap() {
     ok "reaped $what (pid $pid, needed SIGKILL)"
 }
 
+# Take a whole session down: the X server and every helper hanging off its
+# display, so nothing is left holding the socket dir or the VNC port.
+reap_session() {
+    local display=$1 pid=$2 spid
+    for spid in $(pgrep -f "xrdp-chansrv" 2>/dev/null) \
+                $(pgrep -f "libpipewire-module-xrdp" 2>/dev/null); do
+        [ "$(disp_num "$(krk_proc_env "$spid" DISPLAY)")" = "$display" ] \
+            && reap "$spid" "helper for :$display"
+    done
+    reap "$pid" "Xvnc :$display"
+    seen_clear "$display"
+}
+
+# --- explicit --kill --------------------------------------------------------
+
+if [ -n "$KILL_DISPLAY" ]; then
+    step "Killing :$KILL_DISPLAY"
+    target=$(krk_xvnc_inventory | awk -F'\t' -v d="$KILL_DISPLAY" '$2 == d')
+    if [ -z "$target" ]; then
+        die "no Xvnc is running on display :$KILL_DISPLAY"
+    fi
+    kpid=$(printf '%s' "$target" | cut -f1)
+    kkind=$(printf '%s' "$target" | cut -f5)
+    kowner=$(krk_pid_user "$kpid")
+    if [ "$kkind" != sesman ]; then
+        warn ":$KILL_DISPLAY is a standalone Xvnc (started by hand, not by xrdp)"
+    fi
+    if krk_display_connected "$KILL_DISPLAY"; then
+        warn ":$KILL_DISPLAY has a client attached right now -- ${kowner:-someone} is using it"
+        warn "killing it closes every application running in that desktop"
+        if [ "$ASSUME_YES" != 1 ] && [ "$KRK_DRY_RUN" != 1 ]; then
+            if [ -t 0 ]; then
+                printf '  kill it anyway? [y/N] '
+                read -r reply
+                case $reply in y|Y|yes|YES) ;; *) die "aborted" ;; esac
+            else
+                die "refusing to kill a desktop in use without --yes"
+            fi
+        fi
+    fi
+    reap_session "$KILL_DISPLAY" "$kpid"
+    echo
+    if [ "$KRK_DRY_RUN" = 1 ]; then
+        info "dry run -- nothing was killed"
+    else
+        info "done"
+    fi
+    exit 0
+fi
+
 step "Xvnc sessions"
 
-while read -r pid display; do
+INVENTORY=$(krk_xvnc_inventory)
+
+while IFS=$'\t' read -r pid display _depth _geom kind; do
     [ -n "${pid:-}" ] || continue
+
+    # A desktop sesman has forgotten cannot be reconnected to by anything: the
+    # session table lives only in sesman's memory, so a restart or a crash
+    # leaves the Xvnc running with nobody able to reach it. It is the one class
+    # of *desktop* that is genuinely garbage rather than parked work -- but it
+    # still contains whatever the user had open, so it is only reaped on
+    # request. Standalone servers (vncserver(1) by hand) are never ours to
+    # judge and are skipped entirely.
+    if [ "$kind" = sesman ] && krk_session_orphaned "$pid"; then
+        if [ "$REAP_ORPHANS" = 1 ]; then
+            warn ":$display -- untracked by sesman, unreachable; reaping"
+            reap_session "$display" "$pid"
+            reaped=$(( reaped + 1 ))
+        else
+            warn ":$display -- untracked by sesman: no client can rejoin it (holding port $(( 5900 + display )))"
+            warn "            reap it with: kali-rdp-cleanup --orphans"
+            live_displays="$live_displays $display"
+        fi
+        continue
+    fi
+    if [ "$kind" != sesman ]; then
+        live_displays="$live_displays $display"
+        [ "$VERBOSE" = 1 ] && ok ":$display -- standalone Xvnc, not an xrdp session, leaving alone"
+        continue
+    fi
+
     if krk_display_connected "$display"; then
         live_displays="$live_displays $display"
         seen_clear "$display"
@@ -160,18 +254,11 @@ while read -r pid display; do
     fi
 
     warn ":$display -- unattached for ${idle}s, reaping session"
-    # chansrv and the window manager hang off the same display; take the whole
-    # session down so nothing is left holding the socket dir.
-    for spid in $(pgrep -f "xrdp-chansrv" 2>/dev/null); do
-        [ "$(disp_num "$(krk_proc_env "$spid" DISPLAY)")" = "$display" ] \
-            && reap "$spid" "xrdp-chansrv for :$display"
-    done
-    reap "$pid" "Xvnc :$display"
-    seen_clear "$display"
+    reap_session "$display" "$pid"
     reaped=$(( reaped + 1 ))
-done <<<"$(krk_xvnc_sessions)"
+done <<<"$INVENTORY"
 
-[ -z "$(krk_xvnc_sessions)" ] && log "  (no Xvnc sessions running)"
+[ -z "$INVENTORY" ] && log "  (no Xvnc sessions running)"
 
 step "Stray xrdp-chansrv"
 
@@ -201,7 +288,7 @@ for pid in $(pgrep -f "libpipewire-module-xrdp" 2>/dev/null); do
         # No DISPLAY to match on. Only reap if it has been reparented to init
         # and no session is running at all -- otherwise leave it be.
         if [ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" = "1" ] \
-           && [ -z "$(krk_xvnc_sessions)" ]; then
+           && [ -z "$INVENTORY" ]; then
             reap "$pid" "orphaned pipewire-xrdp module (no live sessions)"
             reaped=$(( reaped + 1 ))
         elif [ "$VERBOSE" = 1 ]; then

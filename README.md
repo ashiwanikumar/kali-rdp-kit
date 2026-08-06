@@ -46,22 +46,47 @@ Safe to re-run; every file it touches is backed up to
 | Display manager | Disables `lightdm`/`gdm3`/`sddm` and switches the default target to `multi-user`. A console session on `:0` shares the user's D-Bus session bus, `ICEauthority`, and agent sockets with RDP sessions; both fight over them. Keep it with `--keep-dm`. |
 | Backend | Verifies the `[Xvnc]` session type and comments out `[Xorg]`, so the login dropdown cannot offer a backend that will hang. |
 | Session policy | Sets `KillDisconnected=false`: disconnecting never closes your apps. Inert on Xvnc anyway, but set explicitly so behaviour cannot change the day xorgxrdp appears. |
+| Security layer | Pins `security_layer=tls`. Kali ships `negotiate` plus a self-signed certificate, and letting clients choose against a certificate they cannot validate produces intermittent handshake failures — a black screen and a drop before any window manager starts. Only applied once the key is confirmed readable, so a host without a usable certificate is never made worse. Override with `--security-layer`. |
 | Cleanup | Enables the `kali-rdp-cleanup.timer`. |
 | tmux | Installs a config that stops multi-client redraw corruption. Never overwrites an existing `~/.tmux.conf`. |
 
 ```
 sudo kali-rdp-setup [-n|--dry-run] [--keep-dm] [--port PORT] [--max-bpp N]
+                    [--security-layer tls|negotiate|rdp]
                     [--reap-disconnected SECONDS] [--no-tmux] [--no-timer]
+                    [--no-restart] [-y|--yes]
 ```
+
+**Restarting orphans running desktops.** `xrdp-sesman` keeps its session table
+in memory, so restarting it forgets every desktop while the `Xvnc` processes
+carry on running. Those desktops keep your applications alive but no client can
+rejoin them — reconnecting builds a new empty one instead. Setup lists exactly
+which desktops a restart would strand and asks before doing it; with no
+terminal to ask on it declines and tells you how to proceed. `--no-restart`
+writes the configuration without applying it; `--yes` skips the prompt.
 
 ### `kali-rdp-doctor` — read-only diagnostics
 
-Runs the checks you would otherwise do by hand across eight areas — packages,
-display-manager conflicts, services, backend config, disconnected-session
-policy, live sessions, orphaned helpers, and recent log errors — and prints the
-command that fixes each problem it finds.
+Runs the checks you would otherwise do by hand across ten areas — packages,
+display-manager conflicts, services, backend config, TLS and security layer,
+disconnected-session policy, live sessions, screen lockers, orphaned helpers,
+and recent log errors — and prints the command that fixes each problem it finds.
 
 Exit status: `0` clean, `1` warnings, `2` failures. Suitable for monitoring.
+
+Two things it deliberately does *not* do:
+
+- **It never reports history as news.** Every log check is scoped to the
+  lifetime of the process that would be producing the errors, so a permission
+  problem you fixed last week stops being reported the moment it is fixed. A
+  tool that keeps failing on a resolved issue teaches you to ignore its
+  failures.
+- **It grades noise as noise.** xrdp logs routine events at `ERROR` level.
+  `g_tcp_bind ... errno=98` in `xrdp-sesman.log` is how sesman *probes* for a
+  free display — the next line is always `Found X server running at ...`.
+  Handshake errors from a client that vanished mid-connect (a phone changing
+  network, a port scanner) look identical to a broken server, so they are
+  counted against successful logins rather than reported on their own.
 
 ### `kali-rdp-cleanup` — orphan reaper
 
@@ -73,13 +98,20 @@ alongside the old one, and they contend for the same sockets.
 client is a disconnect, not a logout: your applications keep running, and
 reconnecting returns you to the same windows, days later if you like.
 
-What *is* reaped is unambiguous garbage — a `xrdp-chansrv` or pipewire module
-whose X server is already gone. Those hold VNC ports and make the next session
-fail to bind (`g_tcp_bind ... errno=98`), which is the actual cause of "xrdp
-worked yesterday and today it won't connect".
+What *is* reaped by default is unambiguous garbage — a `xrdp-chansrv` or
+pipewire module whose X server is already gone. Those hold sockets and leak
+memory for as long as the box stays up.
+
+There is one further class, reported but never reaped without asking: a desktop
+`sesman` no longer tracks. Its session table lives only in memory, so a sesman
+restart or crash leaves the `Xvnc` running with no path back to it — the
+applications are alive, and unreachable. `--orphans` clears them; `--kill
+DISPLAY` takes down one specific desktop, refusing a desktop currently in use
+unless you pass `--yes`.
 
 ```
 sudo kali-rdp-cleanup [-n|--dry-run] [-g|--grace SECONDS|never] [-v|--verbose]
+                      [--orphans] [--kill DISPLAY] [-y|--yes]
 ```
 
 On a shared box you may want idle desktops reclaimed. That is opt-in, because
