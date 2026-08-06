@@ -33,6 +33,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/*.deb \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes
+          # Idempotent: a tag can be re-pointed (a corrected message, a history
+          # rewrite), which re-fires this workflow. Refresh the assets rather
+          # than failing the run on an already-published release.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME exists; refreshing assets"
+            gh release upload "$GITHUB_REF_NAME" dist/*.deb --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.deb \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes
+          fi
