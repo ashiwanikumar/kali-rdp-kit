@@ -150,6 +150,13 @@ EOF
         ok "wrote $xs"
     fi
 
+    # Applies to every profile, not just Xfce. Any autostarted screen locker
+    # turns a dropped RDP connection into a lockout: the client reconnects, the
+    # desktop is there, and the unlock dialog will not take keyboard focus.
+    info "disabling screen lockers (lockout risk over RDP)"
+    # shellcheck disable=SC2086
+    krk_disable_autostart "$user" "$home" $KRK_LOCKERS
+
     if declare -F profile_tweak >/dev/null; then
         info "applying $name workarounds"
         profile_tweak "$home" "$user"

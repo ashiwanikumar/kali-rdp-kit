@@ -345,7 +345,39 @@ else
     fi
 fi
 
-step "7. Orphaned helper processes"
+step "7. Screen lockers"
+
+# The failure this catches: reconnect after hours away, land on a lock prompt,
+# and discover the unlock dialog cannot take keyboard focus under Xvnc. The RDP
+# layer already authenticated -- a second lock buys nothing and can cost you
+# the session.
+running_lockers=$(krk_running_lockers)
+if [ -n "$running_lockers" ]; then
+    flag "screen locker running: ${running_lockers% } -- a reconnect may land on a lock prompt"
+    fix "sudo kali-rdp-profile set <your-profile>   # disables lockers for the user"
+    fix "pkill -f <locker>                          # stop the running one now"
+else
+    pass "no screen locker running"
+fi
+
+locker_autostart=""
+for _lk in $KRK_LOCKERS; do
+    [ -f "/etc/xdg/autostart/$_lk.desktop" ] || continue
+    # An override with Hidden=true is what stops it starting next session.
+    if [ -f "$HOME/.config/autostart/$_lk.desktop" ] \
+       && grep -q '^Hidden=true' "$HOME/.config/autostart/$_lk.desktop" 2>/dev/null; then
+        continue
+    fi
+    locker_autostart="$locker_autostart$_lk "
+done
+if [ -n "$locker_autostart" ]; then
+    flag "will autostart next session: ${locker_autostart% }"
+    fix "sudo kali-rdp-profile set <your-profile>"
+else
+    pass "no screen locker will autostart"
+fi
+
+step "8. Orphaned helper processes"
 
 orphan_total=0
 count_orphans() {
@@ -386,7 +418,7 @@ fi
 
 # --- 8. logs ----------------------------------------------------------------
 
-step "8. Recent errors in xrdp logs"
+step "9. Recent errors in xrdp logs"
 
 log_hits=0
 for f in /var/log/xrdp-sesman.log /var/log/xrdp.log; do

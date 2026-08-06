@@ -18,6 +18,7 @@ NO_TMUX=0
 NO_TIMER=0
 REAP_DISCONNECTED=""
 RDP_PORT=""
+MAX_BPP=""
 CHANGED=0
 
 usage() {
@@ -38,6 +39,11 @@ Options:
   -n, --dry-run            print what would change, change nothing
       --keep-dm            leave lightdm/gdm3/sddm alone (console GUI needed)
       --port PORT          set the xrdp listening port (default: leave as-is)
+      --max-bpp N          cap colour depth at N (8|15|16|24|32). Set this when
+                           you connect from several devices: xrdp keys sessions
+                           on colour depth, so a phone negotiating a different
+                           depth than your desktop gets a SEPARATE desktop.
+                           Capping low makes every client converge on one.
       --reap-disconnected S close desktops left disconnected for S seconds.
                            Off by default -- this CLOSES USERS' APPLICATIONS.
       --no-tmux            skip the tmux config
@@ -51,6 +57,11 @@ while [ $# -gt 0 ]; do
         -n|--dry-run)        KRK_DRY_RUN=1 ;;
         --keep-dm)           KEEP_DM=1 ;;
         --port)              RDP_PORT=${2:?--port needs a value}; shift ;;
+        --max-bpp)           MAX_BPP=${2:?--max-bpp needs a value}; shift
+                             case $MAX_BPP in
+                                 8|15|16|24|32) ;;
+                                 *) die "--max-bpp must be one of 8, 15, 16, 24, 32" ;;
+                             esac ;;
         --reap-disconnected) REAP_DISCONNECTED=${2:?--reap-disconnected needs a value}; shift
                              case $REAP_DISCONNECTED in
                                  ''|*[!0-9]*) die "--reap-disconnected needs a number of seconds" ;;
@@ -173,6 +184,25 @@ if [ -n "$RDP_PORT" ]; then
     fi
 else
     ok "listening port left at $(ini_get "$XRDP_INI" Globals port)"
+fi
+
+# xrdp's session-allocation Policy always includes the B (bits-per-pixel)
+# criterion and it cannot be switched off, so two clients negotiating different
+# colour depths get two separate desktops for the same user. Capping the depth
+# server-side makes every client that asks for at least the cap converge on one
+# session -- which is what you want when a phone and a laptop should reach the
+# same running work.
+if [ -n "$MAX_BPP" ]; then
+    if ini_set "$XRDP_INI" Globals max_bpp "$MAX_BPP"; then
+        info "max_bpp=$MAX_BPP -- clients requesting more will be capped to it"
+        note_change
+    else
+        ok "max_bpp already $MAX_BPP"
+    fi
+    [ "$MAX_BPP" -gt 16 ] 2>/dev/null && \
+        warn "a client asking for less than $MAX_BPP still gets its own session; 16 converges more clients"
+else
+    ok "colour depth left at max_bpp=$(ini_get "$XRDP_INI" Globals max_bpp)"
 fi
 
 # Xvnc must stay bound to loopback; xrdp is the only thing that should reach it.

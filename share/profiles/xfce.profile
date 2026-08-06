@@ -10,12 +10,24 @@ profile_tweak() {
     local home=$1 user=$2
 
     # Compositing over a VNC transport is pure cost: every damage event becomes
-    # a full recomposite that then has to be encoded and shipped. Off is both
-    # faster and one less thing interacting with the session-start sequence.
-    local xfwm="$home/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml"
-    if [ ! -f "$xfwm" ]; then
-        run install -d -o "$user" -g "$user" -m 0755 "$(dirname "$xfwm")"
-        if [ "${KRK_DRY_RUN:-0}" != 1 ]; then
+    # a full recomposite that then has to be encoded and shipped.
+    #
+    # Applied to the live session first. Writing the XML is only correct when
+    # no session is running -- otherwise xfconfd holds the settings in memory
+    # and overwrites the file on logout, silently discarding the change.
+    if krk_xfconf_set "$user" xfwm4 /general/use_compositing bool false; then
+        ok "compositing disabled in the running session"
+    else
+        local xfwm="$home/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml"
+        if [ -f "$xfwm" ]; then
+            # Rewriting this file wholesale would discard the user's theme,
+            # keybindings and window rules, so leave it and say so plainly
+            # rather than pretending the setting was applied.
+            warn "compositing left as-is: $(basename "$xfwm") already exists and no session is running"
+            warn "apply it from inside a session with:"
+            warn "  xfconf-query -c xfwm4 -p /general/use_compositing -s false"
+        elif [ "${KRK_DRY_RUN:-0}" != 1 ]; then
+            install -d -o "$user" -g "$(id -gn "$user")" -m 0755 "$(dirname "$xfwm")"
             cat >"$xfwm" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Installed by kali-rdp-kit: compositing is a net loss over VNC. -->
@@ -25,30 +37,13 @@ profile_tweak() {
   </property>
 </channel>
 EOF
-            chown "$user:$user" "$xfwm"
+            chown "$user:$(id -gn "$user")" "$xfwm"
+            ok "compositing disabled for the next session"
         fi
     fi
 
-    # A screen lock inside an RDP session is a lockout risk, not a security
-    # gain: the RDP layer already authenticated, and the unlock dialog often
-    # cannot get keyboard focus under Xvnc.
-    local saver="$home/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-screensaver.xml"
-    if [ ! -f "$saver" ]; then
-        run install -d -o "$user" -g "$user" -m 0755 "$(dirname "$saver")"
-        if [ "${KRK_DRY_RUN:-0}" != 1 ]; then
-            cat >"$saver" <<'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!-- Installed by kali-rdp-kit: screen locking inside RDP is a lockout risk. -->
-<channel name="xfce4-screensaver" version="1.0">
-  <property name="saver" type="empty">
-    <property name="enabled" type="bool" value="false"/>
-  </property>
-  <property name="lock" type="empty">
-    <property name="enabled" type="bool" value="false"/>
-  </property>
-</channel>
-EOF
-            chown "$user:$user" "$saver"
-        fi
-    fi
+    # Belt and braces alongside the autostart override applied to every
+    # profile: if the locker is somehow started anyway, it still will not lock.
+    krk_xfconf_set "$user" xfce4-screensaver /saver/enabled bool false || true
+    krk_xfconf_set "$user" xfce4-screensaver /lock/enabled bool false || true
 }

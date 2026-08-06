@@ -2,7 +2,7 @@
 # Shared helpers for kali-rdp-kit. Sourced, never executed.
 # shellcheck disable=SC2034  # these are consumed by the scripts that source us
 
-KRK_VERSION="0.3.0"
+KRK_VERSION="0.4.0"
 KRK_XRDP_DIR="${KRK_XRDP_DIR:-/etc/xrdp}"
 KRK_STATE_DIR="${KRK_STATE_DIR:-/var/lib/kali-rdp-kit}"
 KRK_BACKUP_DIR="${KRK_BACKUP_DIR:-$KRK_STATE_DIR/backups}"
@@ -217,6 +217,90 @@ krk_ensure_node() {
         fi
     fi
     return 0
+}
+
+# --- desktop settings ------------------------------------------------------
+
+# krk_disable_autostart USER HOME APP...
+#
+# Suppress a desktop autostart entry via the freedesktop override mechanism.
+#
+# This is deliberately used instead of toggling an application's own settings:
+# a program that never starts cannot lock the screen, whatever its config says,
+# and it works identically whether or not the user has ever logged in. Editing
+# an app's config only helps if the config is read, is not overwritten by a
+# running settings daemon, and the app honours it.
+krk_disable_autostart() {
+    local user=$1 home=$2; shift 2
+    local dir="$home/.config/autostart" app f grp
+    grp=$(id -gn "$user" 2>/dev/null) || grp=$user
+
+    for app in "$@"; do
+        # Only shadow entries that actually exist system-wide; writing an
+        # override for an uninstalled app just litters the profile.
+        [ -f "/etc/xdg/autostart/$app.desktop" ] || continue
+        f="$dir/$app.desktop"
+        if [ -f "$f" ] && grep -q '^Hidden=true' "$f" 2>/dev/null; then
+            ok "$app autostart already disabled"
+            continue
+        fi
+        if [ "${KRK_DRY_RUN:-0}" = 1 ]; then
+            printf '%s  would disable%s %s autostart for %s\n' \
+                "$C_DIM" "$C_RESET" "$app" "$user"
+            continue
+        fi
+        install -d -o "$user" -g "$grp" -m 0755 "$dir" || continue
+        cat >"$f" <<EOF
+[Desktop Entry]
+Type=Application
+Name=$app
+Hidden=true
+# Disabled by kali-rdp-kit. A screen lock inside an RDP session is a lockout
+# risk rather than a security gain: the RDP layer has already authenticated,
+# and the unlock dialog frequently cannot take keyboard focus under Xvnc.
+EOF
+        chown "$user:$grp" "$f"
+        info "disabled $app autostart for $user"
+    done
+}
+
+# krk_xfconf_set USER CHANNEL PROPERTY TYPE VALUE
+#
+# Apply an Xfce setting to a *running* session. A live xfconfd owns the
+# settings in memory and rewrites its XML on exit, so editing those files
+# underneath it is silently discarded -- this goes through xfconf-query
+# instead. Returns 1 when the user has no live session, so callers can fall
+# back to writing config for the next login.
+krk_xfconf_set() {
+    local user=$1 channel=$2 prop=$3 type=$4 value=$5 spid dbus disp
+    have xfconf-query || return 1
+    spid=$(pgrep -u "$user" -f xfce4-session 2>/dev/null | head -1) || return 1
+    [ -n "$spid" ] || return 1
+    dbus=$(krk_proc_env "$spid" DBUS_SESSION_BUS_ADDRESS) || return 1
+    [ -n "$dbus" ] || return 1
+    disp=$(krk_proc_env "$spid" DISPLAY)
+    if [ "${KRK_DRY_RUN:-0}" = 1 ]; then
+        printf '%s  would set%s %s %s=%s in the live session\n' \
+            "$C_DIM" "$C_RESET" "$channel" "$prop" "$value"
+        return 0
+    fi
+    runuser -u "$user" -- env DISPLAY="${disp:-:0}" DBUS_SESSION_BUS_ADDRESS="$dbus" \
+        xfconf-query -c "$channel" -p "$prop" -n -t "$type" -s "$value" >/dev/null 2>&1
+}
+
+# Screen lockers that autostart on a Debian-family desktop. Any of these
+# turns a dropped RDP connection into a lockout.
+KRK_LOCKERS="xfce4-screensaver light-locker xscreensaver gnome-screensaver mate-screensaver"
+
+krk_running_lockers() {
+    # -f, not -x: "xfce4-screensaver" exceeds the 15-character comm name that
+    # -x matches against, so -x silently finds nothing.
+    local app pids out=""
+    for app in $KRK_LOCKERS; do
+        pids=$(pgrep -f "$app" 2>/dev/null | tr '\n' ' ')
+        [ -n "$pids" ] && out="$out$app "
+    done
+    printf '%s' "$out"
 }
 
 krk_init_state() {

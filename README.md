@@ -31,7 +31,7 @@ separate, explicit step, and `--dry-run` prints every change first.
 | `kali-rdp-cleanup` | Reaps orphaned session processes |
 | `kali-rdp-profile` | Chooses and tunes the desktop a session starts |
 | `kali-rdp-user` | Provisions users for RDP access |
-| `kali-ssh-setup` | SSH keepalives, session persistence, hardening |
+| `kali-ssh-setup` | SSH keepalives, mosh, tmux auto-attach, hardening |
 
 Every one of them takes `--dry-run`.
 
@@ -50,7 +50,7 @@ Safe to re-run; every file it touches is backed up to
 | tmux | Installs a config that stops multi-client redraw corruption. Never overwrites an existing `~/.tmux.conf`. |
 
 ```
-sudo kali-rdp-setup [-n|--dry-run] [--keep-dm] [--port PORT]
+sudo kali-rdp-setup [-n|--dry-run] [--keep-dm] [--port PORT] [--max-bpp N]
                     [--reap-disconnected SECONDS] [--no-tmux] [--no-timer]
 ```
 
@@ -97,6 +97,11 @@ See [docs/session-persistence.md](docs/session-persistence.md) for the full
 picture, including why reconnecting sometimes hands you an empty desktop while
 your windows are still running in another session.
 
+Running long jobs — AI agents, scans, builds — and checking them from a phone or
+tablet? See [docs/remote-monitoring.md](docs/remote-monitoring.md). Short version:
+run the job in `tmux` and reach it over SSH/mosh rather than RDP, so the job's
+survival does not depend on the desktop's.
+
 ### `kali-rdp-profile` — desktop profiles
 
 Picks what an RDP session starts, and applies the workarounds that make that
@@ -112,6 +117,12 @@ kali-rdp-profile show
 
 `openbox` and `i3` are marked recommended: neither runs a session manager with
 a startup sequence that can time out. `xfce` is marked known-issue — see below.
+
+Every profile also **disables screen lockers** (`xfce4-screensaver`,
+`light-locker`, `xscreensaver`, …) via a freedesktop autostart override. A lock
+screen inside RDP is a lockout risk rather than a security gain: the RDP layer
+already authenticated, and the unlock dialog often cannot take keyboard focus
+under Xvnc — so you reconnect after hours away and cannot type into the prompt.
 
 ### `kali-rdp-user` — provisioning
 
