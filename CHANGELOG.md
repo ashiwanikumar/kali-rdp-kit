@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Three scripts -- `kali-rdp-profile`, `kali-rdp-user`, `kali-ssh-setup` -- had
+  shipped non-executable in git since the day they were added. The `.deb` was
+  unaffected, because `build-deb.sh` installs with an explicit mode, so nothing
+  ever caught it and only someone running from a checkout found out. Fixed, with
+  a test that fails if any tracked script loses its mode again.
+- `tools/reproduce-xfce-25s.sh`: a self-contained attempt to reproduce the Xfce
+  ~25s session exit against a throwaway account, over a real RDP login, with
+  `strace` and `dbus-monitor` attached before the failure window. Never touches
+  the invoking user's session.
+- `docs/xfce-25s.md` rewritten around two findings: 25 seconds is libdbus's
+  default reply timeout, so the bug is a D-Bus call with no responder rather
+  than a crash; and the fault does not reproduce on current packages under four
+  distinct conditions. The Xfce profile is now `unreproduced` rather than a flat
+  `known-issue`.
 - `build-deb.sh` produces a byte-reproducible package. Pinning the umask was
   never enough on its own: `install(1)` stamps every file with the current
   time, so two builds of identical source differed and anyone comparing their

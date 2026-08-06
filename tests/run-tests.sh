@@ -457,6 +457,28 @@ out=$(NO_COLOR=1 "$SETUP" --max-bpp 7 2>&1); rc=$?
 check "an invalid colour depth is refused" "$rc" "1"
 
 # ---------------------------------------------------------------------------
+section "repository hygiene"
+
+# Three scripts shipped non-executable in git from the day they were added.
+# The .deb was unaffected -- build-deb.sh installs with an explicit mode -- so
+# nothing caught it, and only someone running from a checkout ever found out.
+if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    nonexec=""
+    for f in $(git -C "$ROOT" ls-files 'bin/*' 'tools/*' install.sh \
+                   packaging/build-deb.sh tests/run-tests.sh \
+                   packaging/debian/postinst packaging/debian/prerm \
+                   packaging/debian/postrm 2>/dev/null); do
+        case $(git -C "$ROOT" ls-files -s "$f" | awk '{print $1}') in
+            100755) ;;
+            *) nonexec="$nonexec $f" ;;
+        esac
+    done
+    check "every script is executable in the index" "${nonexec# }" ""
+else
+    echo "  skip: not a git checkout"
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n%s%d passed, %d failed%s\n' \
     "$([ "$FAIL" -eq 0 ] && printf '%s' "$grn" || printf '%s' "$red")" \
     "$PASS" "$FAIL" "$rst"

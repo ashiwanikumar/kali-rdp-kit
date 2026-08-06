@@ -1,10 +1,10 @@
 # shellcheck shell=bash
 # Xfce -- full desktop, but see the session-stability caveat below.
 
-PROFILE_DESC="Xfce 4 full desktop. Feature-complete, but see docs/xfce-25s.md: xfwm4 has been observed exiting ~25s into a session under Xvnc."
+PROFILE_DESC="Xfce 4 full desktop. Feature-complete. docs/xfce-25s.md records a reported ~25s xfwm4 exit under Xvnc that does not reproduce on current packages."
 PROFILE_PACKAGES="xfce4 xfce4-terminal"
 PROFILE_SESSION="xfce4-session"
-PROFILE_STATUS="known-issue"
+PROFILE_STATUS="unreproduced"
 
 profile_tweak() {
     local home=$1 user=$2

@@ -53,6 +53,7 @@ status_badge() {
     case $1 in
         recommended) printf '%srecommended%s' "$C_GRN" "$C_RESET" ;;
         known-issue) printf '%sknown issue%s' "$C_YEL" "$C_RESET" ;;
+        unreproduced) printf '%sreported, unreproduced%s' "$C_YEL" "$C_RESET" ;;
         heavy)       printf '%sheavy%s' "$C_YEL" "$C_RESET" ;;
         *)           printf '%s' "$1" ;;
     esac
@@ -113,8 +114,17 @@ cmd_set() {
     [ -d "$home" ] || die "$user has no home directory at $home"
 
     info "setting $user's session to $name ($PROFILE_SESSION)"
-    [ "$PROFILE_STATUS" = "known-issue" ] && \
-        warn "$name has a known session-stability issue; see docs/xfce-25s.md"
+    case $PROFILE_STATUS in
+        known-issue)
+            warn "$name has a known session-stability issue; see docs/xfce-25s.md" ;;
+        unreproduced)
+            # Saying "known issue" about something that no longer reproduces
+            # sends people to a worse desktop on stale evidence. Saying nothing
+            # hides a report that was real when it was made. Say both.
+            warn "$name has a reported session-stability issue that does not reproduce"
+            warn "on current packages; see docs/xfce-25s.md, and"
+            warn "sudo ./tools/reproduce-xfce-25s.sh if you hit it" ;;
+    esac
 
     # Only install what is missing, so re-running is cheap.
     local missing="" pkg

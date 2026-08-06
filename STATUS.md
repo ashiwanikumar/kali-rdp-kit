@@ -144,8 +144,14 @@ Small, none blocking:
   that tag gives a different checksum (timestamps only; contents were verified
   identical). Re-pointing the tag would refresh it — the release workflow is
   idempotent — but nothing is wrong with the published package.
-- The Xfce ~25s session exit is still the project's biggest gap and predates all
-  of this: `docs/xfce-25s.md` describes a workaround, not a diagnosis.
+- The Xfce ~25s session exit is still not root-caused, but it is no longer
+  unfalsifiable: `tools/reproduce-xfce-25s.sh` tries it against a throwaway
+  account over a real RDP login, and it did not reproduce under four conditions
+  on current packages. The leading untested hypothesis is a console
+  display-manager session competing with the RDP session for the user bus --
+  which `kali-rdp-setup` already prevents by disabling the display manager, and
+  which would explain why it no longer occurs. Testing it needs a scratch host,
+  because the collision under test would take out a live desktop.
 
 ## Working on it
 

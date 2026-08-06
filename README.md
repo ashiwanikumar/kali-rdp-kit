@@ -153,7 +153,8 @@ kali-rdp-profile show
 ```
 
 `openbox` and `i3` are marked recommended: neither runs a session manager with
-a startup sequence that can time out. `xfce` is marked known-issue — see below.
+a startup sequence that can time out. `xfce` is marked reported-but-unreproduced
+— see below.
 
 Every profile also **disables screen lockers** (`xfce4-screensaver`,
 `light-locker`, `xscreensaver`, …) via a freedesktop autostart override. A lock

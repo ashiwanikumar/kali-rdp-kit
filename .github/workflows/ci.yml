@@ -18,6 +18,7 @@ jobs:
             bin/kali-rdp-setup bin/kali-rdp-doctor bin/kali-rdp-cleanup \
             bin/kali-rdp-user bin/kali-rdp-profile bin/kali-ssh-setup \
             install.sh packaging/build-deb.sh lib/common.sh tests/run-tests.sh \
+            tools/reproduce-xfce-25s.sh \
             packaging/debian/postinst packaging/debian/prerm packaging/debian/postrm
 
   tests:
