@@ -193,6 +193,26 @@ fi
 # session -- which is what you want when a phone and a laptop should reach the
 # same running work.
 if [ -n "$MAX_BPP" ]; then
+    # Changing the cap strands any desktop already running at a different
+    # depth: the B criterion will never match it again, so it keeps running
+    # with the user's work in it and no client can reach it. Nothing is killed
+    # -- but "my apps vanished" is exactly how that feels, so say it first.
+    stranded=$(ps -eo args= 2>/dev/null | awk -v cap="$MAX_BPP" '
+        /[X]vnc :[0-9]+/ {
+            disp=""; depth=""
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^:[0-9]+$/) disp = $i
+                if ($i == "-depth") depth = $(i + 1)
+            }
+            if (disp != "" && depth != "" && depth + 0 != cap + 0)
+                print disp "@" depth "bpp"
+        }')
+    if [ -n "$stranded" ]; then
+        warn "running desktops at a different colour depth will become UNREACHABLE:"
+        for _s in $stranded; do warn "    ${_s%@*} (${_s#*@})"; done
+        warn "nothing is killed -- they keep running, but no client can rejoin them"
+        warn "log out of them first, or set --max-bpp to their depth to get back in"
+    fi
     if ini_set "$XRDP_INI" Globals max_bpp "$MAX_BPP"; then
         info "max_bpp=$MAX_BPP -- clients requesting more will be capped to it"
         note_change

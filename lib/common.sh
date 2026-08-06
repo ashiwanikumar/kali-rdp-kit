@@ -2,7 +2,7 @@
 # Shared helpers for kali-rdp-kit. Sourced, never executed.
 # shellcheck disable=SC2034  # these are consumed by the scripts that source us
 
-KRK_VERSION="0.4.0"
+KRK_VERSION="0.4.1"
 KRK_XRDP_DIR="${KRK_XRDP_DIR:-/etc/xrdp}"
 KRK_STATE_DIR="${KRK_STATE_DIR:-/var/lib/kali-rdp-kit}"
 KRK_BACKUP_DIR="${KRK_BACKUP_DIR:-$KRK_STATE_DIR/backups}"

@@ -113,6 +113,12 @@ Two ways to handle it:
    A client requesting *less* than the cap still gets its own session, so pick
    the lowest depth you are willing to look at.
 
+> ⚠️ **Changing the cap strands existing desktops.** A desktop already running
+> at 32bpp can never be matched again once the cap is 16 — it keeps running with
+> your work in it, and no client can reach it. `kali-rdp-setup` warns and names
+> the affected displays before it applies the change. Either log out of them
+> first, or temporarily set `--max-bpp` back to their depth to get back in.
+
 Check for accumulated desktops any time:
 
 ```bash
