@@ -82,7 +82,9 @@ EOF
 install_dev_tools() {
     local name=$1 home=$2 missing="" pkg
 
-    krk_ensure_node
+    # Deliberately not fatal: Claude Code below ships as a self-contained binary
+    # and does not need node, so a node failure must not cost the user the rest.
+    krk_ensure_node || true
 
     for pkg in $KRK_DEV_PACKAGES; do
         dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" \

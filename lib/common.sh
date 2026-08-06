@@ -2,7 +2,7 @@
 # Shared helpers for kali-rdp-kit. Sourced, never executed.
 # shellcheck disable=SC2034  # these are consumed by the scripts that source us
 
-KRK_VERSION="0.2.0"
+KRK_VERSION="0.3.0"
 KRK_XRDP_DIR="${KRK_XRDP_DIR:-/etc/xrdp}"
 KRK_STATE_DIR="${KRK_STATE_DIR:-/var/lib/kali-rdp-kit}"
 KRK_BACKUP_DIR="${KRK_BACKUP_DIR:-$KRK_STATE_DIR/backups}"
@@ -170,6 +170,10 @@ krk_xorgxrdp_usable() {
 # one user's home and is invisible to every account created afterwards -- which
 # is exactly how a freshly provisioned user ends up with a working desktop and
 # no runtime at all.
+#
+# Note this is NOT a Claude Code prerequisite: its native install is a
+# self-contained binary. Node is here for ordinary development work, so failing
+# to install it must never block anything else.
 KRK_NODE_MIN_MAJOR="${KRK_NODE_MIN_MAJOR:-20}"
 
 krk_node_major() {
@@ -198,14 +202,21 @@ krk_ensure_node() {
 
     info "installing nodejs and npm system-wide"
     run env DEBIAN_FRONTEND=noninteractive apt-get update -qq
-    run env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs npm \
-        || die "could not install nodejs (needed for Claude Code)"
+    if ! run env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs npm; then
+        warn "could not install nodejs; continuing (nothing else here depends on it)"
+        return 1
+    fi
 
     if [ "${KRK_DRY_RUN:-0}" != 1 ]; then
         major=$(krk_node_major) || major=""
-        [ -n "$major" ] && [ "$major" -ge "$KRK_NODE_MIN_MAJOR" ] 2>/dev/null \
-            || warn "installed node reports version '${major:-unknown}', wanted >= $KRK_NODE_MIN_MAJOR"
+        if [ -z "$major" ] || ! [ "$major" -ge "$KRK_NODE_MIN_MAJOR" ] 2>/dev/null; then
+            # Distro archives lag: Ubuntu 24.04 ships node 18, 22.04 ships 12.
+            # Usable, but not current -- say so rather than silently shipping it.
+            warn "archive node is ${major:-unknown}, older than the recommended $KRK_NODE_MIN_MAJOR"
+            warn "for a current release see https://deb.nodesource.com (adds a third-party repo)"
+        fi
     fi
+    return 0
 }
 
 krk_init_state() {

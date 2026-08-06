@@ -127,7 +127,7 @@ actually enforces one (it reads `AlwaysGroupCheck` and `TerminalServerUsers`
 rather than assuming), installs the tmux config, and applies a desktop profile.
 
 `--with-dev-tools` additionally installs **node system-wide** (`/usr/bin/node`,
-from Kali's own archive) plus `git`, `ripgrep`, and `build-essential`, then
+from the distro archive) plus `git`, `ripgrep`, and `build-essential`, then
 installs **Claude Code** for that user and puts `~/.local/bin` on their `PATH`.
 
 Node goes system-wide deliberately: an `nvm` install lives in one user's home
@@ -136,6 +136,10 @@ ends up with a working desktop and no runtime. Claude Code goes per-user just as
 deliberately: it self-updates in place under `~/.local/share/claude`, so a single
 shared copy would either fail to update or let one user's upgrade silently change
 everyone else's version.
+
+Node is **not** a Claude Code prerequisite — the native install is a
+self-contained binary. It's here for ordinary development work, so a failed node
+install is a warning, never a blocker.
 
 The flag is idempotent — re-run it on an existing user to add the toolchain
 without touching anything else.
@@ -248,10 +252,44 @@ Configuration changes are not reverted automatically — restore from
 `/var/lib/kali-rdp-kit/backups/`, which is preserved until you purge the
 package.
 
+## Does this work on Ubuntu?
+
+**Mostly — and the tools adapt automatically — but it is untested there, and one
+premise genuinely differs.**
+
+Everything is gated on capability rather than distro: `kali-rdp-doctor` and
+`kali-rdp-setup` branch on whether `xorgxrdp` is installed, not on which distro
+is running. So the behaviour changes on its own where it should.
+
+| | Kali | Ubuntu (24.04 / 22.04) |
+|---|---|---|
+| `xorgxrdp` in the archive | **No** | **Yes** (universe) |
+| Working backend | Xvnc only | Xorg *or* Xvnc |
+| `KillDisconnected` honoured? | No — inert | **Yes** |
+| Default display manager | none / lightdm | gdm3 (handled) |
+| `nodejs` in archive | 24.x | 18.x (24.04), 12.x (22.04) |
+
+The consequence: **on Ubuntu the Xorg backend actually works**, so `setup` leaves
+it enabled and you may prefer it — it generally outperforms Xvnc. And because
+sesman honours `KillDisconnected` there, `setup` writing `KillDisconnected=false`
+is what preserves persistent desktops rather than being a no-op.
+
+Untested and likely to need attention on Ubuntu:
+
+- The whole toolkit is **unverified on Ubuntu** — it is developed and tested on
+  Kali Rolling only. Treat it as "should work", not "known to work".
+- `--with-dev-tools` installs the archive's node: **18 on 24.04, 12 on 22.04**.
+  Both are older than recommended; the tool warns and points at NodeSource.
+- The `xfce` profile's ~25s issue was only ever observed under Xvnc. On Ubuntu's
+  Xorg backend it may not reproduce at all.
+
+Reports from Ubuntu users are very welcome — that is the fastest way to turn
+"should work" into "does work".
+
 ## Scope
 
-Kali Rolling, `xrdp` 0.10.x, Xvnc backend. It should work on Debian-based
-systems generally, but that is untested. Contributions welcome — especially a
-real diagnosis of the Xfce issue above.
+Developed and tested on Kali Rolling with `xrdp` 0.10.x and the Xvnc backend.
+Debian and Ubuntu should work (see above) but are untested. Contributions
+welcome — especially a real diagnosis of the Xfce issue above.
 
 MIT licensed.
