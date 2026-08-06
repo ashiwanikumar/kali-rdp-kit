@@ -102,12 +102,14 @@ Done on a Kali VM under vCenter, xrdp 0.10.6.1, Xvnc backend, single user:
 - `negotiate` + snakeoil detection, and the `negotiate → tls` upgrade, exercised
   against a sandbox copy of `/etc/xrdp` under `unshare -r`.
 
-## Not verified, and why
+Confirmed as real root after installing 0.5.0: `krk_can_read_as` returns 0 via
+the `runuser` path against `/etc/xrdp/key.pem`, so `sudo kali-rdp-doctor`
+reports "xrdp can read the TLS key" from an actual read rather than an
+inference. `sudo kali-rdp-setup --dry-run` reports 0 changes and skips the
+restart, which is the correct answer on an already-configured host and means the
+restart guard is not tripped needlessly.
 
-**`krk_can_read_as` has never run as real root here** — this account has no
-passwordless sudo. The `runuser` path is reasoned, not observed. It fails safe:
-if `runuser` does not work, the control check fails, the function returns 2, and
-callers fall back to group membership. Worth confirming on a host with root.
+## Not verified, and why
 
 **The restart-orphans-desktops behaviour is inferred, not reproduced.** It
 follows from three observed facts — sesman's session table is in-memory, `Xvnc`
@@ -131,6 +133,7 @@ Small, none blocking:
 - Depth `?` (an `Xvnc` with no `-depth` in argv) would be treated as a distinct
   colour depth by the multi-depth warning. Not reachable via sesman, which
   always passes `-depth`.
+- `MaxSessions=50` is the only warning left on this host.
 - The doctor's `--watch` re-execs itself; each iteration builds fresh log
   windows. Fine at a 5s interval on this host, but it is O(log size) per tick.
 
