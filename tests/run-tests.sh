@@ -390,6 +390,20 @@ out=$(KRK_XRDP_DIR="$TMP/xrdp" KRK_XRDP_LOG="$TMP/xrdp.log" \
 lacks "security_layer=tls clears the warning" \
     "$out" "known cause of intermittent handshake failures"
 
+# Screen-locker autostart lives in a user's home, so a check driven by $HOME
+# gives a different answer under sudo than it does as the user -- warning that a
+# locker will start in a desktop where it was disabled years ago. The verdict
+# must depend on the account, never on whichever $HOME happens to be set.
+locker_section() {
+    env "$@" KRK_XRDP_DIR="$TMP/xrdp" KRK_XRDP_LOG="$TMP/xrdp.log" \
+        KRK_SESMAN_LOG="$TMP/sesman.log" NO_COLOR=1 "$DOC" 2>&1 \
+        | sed -n '/Screen lockers/,/Orphaned helper/p'
+}
+check "the locker verdict does not change with \$HOME" \
+    "$(locker_section HOME="$TMP/no-such-home")" "$(locker_section HOME="$HOME")"
+contains "and it names the account it actually checked" \
+    "$(locker_section HOME="$TMP/no-such-home")" "checked: "
+
 # An unreadable log must be reported as unreadable, never as "all clear".
 if [ "$(id -u)" -ne 0 ]; then
     printf 'x\n' >"$TMP/secret.log"; chmod 000 "$TMP/secret.log"

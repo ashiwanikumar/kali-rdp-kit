@@ -55,6 +55,13 @@ desktops and could send the reaper after a pid that had already exited.
 **`backup_file` aborted under `set -u`** when called without `krk_init_state`,
 at the moment it was about to overwrite a file.
 
+**The screen-locker check read the wrong home directory.** It looked in
+`$HOME`, which is root's home the moment the doctor runs under sudo, so it
+found no override and warned that a locker would start in a desktop where it
+had been disabled long ago. It now resolves the invoking account (through
+`SUDO_USER`) and the owners of running desktops, names which accounts it
+checked, and says so rather than guessing when a home is unreadable.
+
 **A key that could not be read was reported as a key that did not exist.**
 `/etc/xrdp/key.pem` points into `/etc/ssl/private`, which is `0710`; `test -e`
 follows the link, fails to traverse, and reports the key absent. Existence and

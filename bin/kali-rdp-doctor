@@ -648,22 +648,51 @@ else
     pass "no screen locker running"
 fi
 
-locker_autostart=""
-for _lk in $KRK_LOCKERS; do
-    [ -f "/etc/xdg/autostart/$_lk.desktop" ] || continue
-    # An override with Hidden=true is what stops it starting next session.
-    if [ -f "$HOME/.config/autostart/$_lk.desktop" ] \
-       && grep -q '^Hidden=true' "$HOME/.config/autostart/$_lk.desktop" 2>/dev/null; then
-        continue
+# Autostart overrides live in a *user's* home, so "$HOME" is the wrong place to
+# look the moment this runs under sudo: it checks root's home, finds no
+# override, and warns that a locker will start in a desktop where it has been
+# disabled for years. The users worth checking are whoever invoked this (their
+# real account, not root) and whoever actually owns a running desktop.
+locker_users=""
+add_locker_user() {
+    local u=$1
+    [ -n "$u" ] || return 0
+    case " $locker_users " in *" $u "*) return 0 ;; esac
+    getent passwd "$u" >/dev/null 2>&1 && locker_users="$locker_users$u "
+}
+add_locker_user "${SUDO_USER:-$(id -un)}"
+while IFS=$'\t' read -r _p _d _dep _g _k; do
+    [ "${_k:-}" = sesman ] && add_locker_user "$(krk_pid_user "$_p")"
+done <<<"$inventory"
+
+locker_any=0
+for _u in $locker_users; do
+    _home=$(getent passwd "$_u" | cut -d: -f6)
+    [ -n "$_home" ] || continue
+    locker_autostart=""
+    for _lk in $KRK_LOCKERS; do
+        [ -f "/etc/xdg/autostart/$_lk.desktop" ] || continue
+        # An override with Hidden=true is what stops it starting next session.
+        if [ -f "$_home/.config/autostart/$_lk.desktop" ] \
+           && grep -q '^Hidden=true' "$_home/.config/autostart/$_lk.desktop" 2>/dev/null; then
+            continue
+        fi
+        # A home this process cannot read tells us nothing either way, and
+        # guessing "not disabled" from a permission error is how the check
+        # earns a reputation for lying.
+        if [ ! -r "$_home/.config" ] && [ "$(id -u)" -ne 0 ]; then
+            note "cannot read $_u's autostart config; skipped"
+            continue 2
+        fi
+        locker_autostart="$locker_autostart$_lk "
+    done
+    if [ -n "$locker_autostart" ]; then
+        flag "will autostart next session for $_u: ${locker_autostart% }"
+        fix "sudo kali-rdp-profile set <your-profile> --user $_u"
+        locker_any=1
     fi
-    locker_autostart="$locker_autostart$_lk "
 done
-if [ -n "$locker_autostart" ]; then
-    flag "will autostart next session: ${locker_autostart% }"
-    fix "sudo kali-rdp-profile set <your-profile>"
-else
-    pass "no screen locker will autostart"
-fi
+[ "$locker_any" -eq 0 ] && pass "no screen locker will autostart (checked: ${locker_users% })"
 
 step "9. Orphaned helper processes"
 
