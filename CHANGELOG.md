@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- `build-deb.sh` produces a byte-reproducible package. Pinning the umask was
+  never enough on its own: `install(1)` stamps every file with the current
+  time, so two builds of identical source differed and anyone comparing their
+  own build against the release asset saw a mismatch they could not explain.
+  Mtimes are now clamped to the last commit's date and `SOURCE_DATE_EPOCH` is
+  exported for `dpkg-deb`. The v0.5.0 asset predates this, so a local build at
+  that tag still differs from the published one in timestamps only -- its
+  contents, modes and owners were verified identical.
+
 ## 0.5.0
 
 Everything here came out of one live debugging session on a Kali VM under

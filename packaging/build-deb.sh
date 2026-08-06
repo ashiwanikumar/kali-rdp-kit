@@ -6,9 +6,19 @@ set -euo pipefail
 
 # Directory modes come from the build tree, so a builder with a permissive
 # umask (002 is common on Debian/Kali, where users get a private group) would
-# otherwise ship group-writable directories -- a lintian error, and a package
-# that differs from the one CI publishes. Pin it.
+# otherwise ship group-writable directories -- a lintian error. Pin it.
 umask 022
+
+# Reproducibility. Pinning the umask alone was never enough to make a local
+# build match the published one: install(1) stamps every file with the current
+# time, so two builds of identical source still differ, and anyone comparing
+# their own build against the release asset sees a mismatch they cannot explain.
+#
+# Clamping mtimes to the last commit's date makes the .deb a function of the
+# source alone. dpkg-deb reads SOURCE_DATE_EPOCH for the archive members; the
+# files inside need touching directly.
+SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git -C "$(dirname "$0")/.." log -1 --pretty=%ct 2>/dev/null || date +%s)}
+export SOURCE_DATE_EPOCH
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 VERSION=$(awk -F'"' '/^KRK_VERSION=/{print $2}' "$ROOT/lib/common.sh")
@@ -52,6 +62,9 @@ done
 
 # Mark the tmux template as a conffile so local edits survive upgrades.
 printf '/usr/share/%s/tmux.conf\n' "$PKG" >"$BUILD/DEBIAN/conffiles"
+
+# Every path, including the DEBIAN control dir and the directories themselves.
+find "$BUILD" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 
 mkdir -p "$DIST"
 DEB="$DIST/${PKG}_${VERSION}_all.deb"
