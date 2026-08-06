@@ -82,7 +82,14 @@ to apply its own fix.
   desktop in use without `--yes`.
 - `--json` gains `tls`, `log_window`, and per-session `owner`, `kind`, `depth`,
   `geometry` and `orphaned`.
-- `KRK_XRDP_LOG` and `KRK_SESMAN_LOG` for non-standard log locations.
+- `KRK_XRDP_LOG` and `KRK_SESMAN_LOG` for non-standard log locations, and
+  `KRK_XRDP_START_EPOCH` / `KRK_SESMAN_START_EPOCH` for hosts where systemd
+  cannot report when a service started.
+- Log-only failures are raised through `log_fail`, which downgrades to a warning
+  when the window could not be dated to the running service. Without it the
+  scoping fix had a hole: on a host with no way to establish a start time, the
+  whole file becomes the window and an ancient error is asserted as current --
+  the original bug by another route.
 - `tests/run-tests.sh`: 49 regression tests, wired into CI. Every one of them
   exists because something above was reported as broken.
 

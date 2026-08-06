@@ -49,6 +49,13 @@ through `krk_log_since` or one of the doctor's pre-built windows
 (`$XRDP_WINDOW`, `$SESMAN_WINDOW`). A bare `grep /var/log/xrdp.log` is the
 v0.4.1 bug, rewritten.
 
+**Undated evidence cannot justify a failure.** When the service start time
+cannot be established the window is the whole file, so a hard `FAIL` from it is
+the same false alarm by another route. Raise log-only failures through
+`log_fail`, which downgrades to a warning and says why it is uncertain. CI
+caught this one: the runner has no xrdp to date against, and the first cut of
+the fix failed there for exactly the reason it was written to prevent.
+
 **"Could not test" is not "failed".** `krk_can_read_as` returns 0/1/2 and the
 three must stay distinct. Collapsing 2 into 1 is what made setup refuse to
 apply its own fix.
@@ -140,6 +147,11 @@ Testing without root or a live xrdp:
 
 - Point `KRK_XRDP_DIR` at a copy of `/etc/xrdp` to exercise config paths.
 - `KRK_XRDP_LOG` / `KRK_SESMAN_LOG` redirect the log checks at fixtures.
+- `KRK_XRDP_START_EPOCH` / `KRK_SESMAN_START_EPOCH` pin the service start time,
+  which makes log scoping deterministic regardless of whether the machine has a
+  live xrdp. They also cover the real case of a host where systemd cannot answer.
+- A `systemctl` stub that exits 1, early on `PATH`, is how the suite reproduces
+  a container or sysvinit host and exercises the undated-log path.
 - `unshare -r` gives a fake root for the `require_root` paths. Beware: inside
   it, `runuser` and `ps -o user=` do not behave like real root, so
   `krk_can_read_as` returns 2 and process owners read as `root`.

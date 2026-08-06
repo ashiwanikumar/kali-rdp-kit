@@ -336,14 +336,35 @@ cat >"$TMP/xrdp.log" <<'EOF'
 EOF
 : >"$TMP/sesman.log"
 
-out=$(KRK_XRDP_DIR="$TMP/xrdp" KRK_XRDP_LOG="$TMP/xrdp.log" \
-      KRK_SESMAN_LOG="$TMP/sesman.log" NO_COLOR=1 "$DOC" 2>&1)
+# Pin the service start so the verdict does not depend on whether the machine
+# running the tests happens to have a live xrdp.
+DATED="KRK_XRDP_START_EPOCH=$(date -d '2026-08-06 04:59:00' +%s 2>/dev/null || echo 1785977940)"
+
+out=$(env KRK_XRDP_DIR="$TMP/xrdp" KRK_XRDP_LOG="$TMP/xrdp.log" \
+      KRK_SESMAN_LOG="$TMP/sesman.log" NO_COLOR=1 "$DATED" "$DOC" 2>&1)
 rc=$?
 lacks "a years-old key error is not reported as a current failure" \
     "$out" "FAIL xrdp.log reports it cannot read the private key"
+lacks "nor as a failure under any other wording" "$out" "key-read failure(s)"
 contains "it is reported as history instead" "$out" "already resolved"
 contains "negotiate + self-signed is warned about" \
     "$out" "known cause of intermittent handshake failures"
+
+# The undated case: with no way to date the log, the same old error must not be
+# asserted as a current fault either. It becomes a warning that says why.
+#
+# A systemctl that answers nothing is how a container or a sysvinit host looks,
+# and stubbing it is the only way to test that path identically on a machine
+# that does have a running xrdp and one that does not.
+mkdir -p "$TMP/nosystemd"
+printf '#!/bin/sh\nexit 1\n' >"$TMP/nosystemd/systemctl"
+chmod +x "$TMP/nosystemd/systemctl"
+
+out=$(env PATH="$TMP/nosystemd:$PATH" KRK_XRDP_DIR="$TMP/xrdp" KRK_XRDP_LOG="$TMP/xrdp.log" \
+      KRK_SESMAN_LOG="$TMP/sesman.log" NO_COLOR=1 "$DOC" 2>&1)
+lacks "an undated log never produces a hard FAIL from log evidence" \
+    "$out" "FAIL xrdp logged"
+contains "an undated log says so instead of guessing" "$out" "undated"
 if [ "$rc" -le 2 ]; then
     PASS=$(( PASS + 1 )); printf '  %sok%s   doctor exits with a defined status (%s)\n' "$grn" "$rst" "$rc"
 else

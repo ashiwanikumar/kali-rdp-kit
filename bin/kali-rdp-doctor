@@ -117,13 +117,18 @@ XRDP_WINDOW_STATE=missing
 SESMAN_WINDOW_STATE=missing
 XRDP_START=""
 
+# open_window LOG UNIT OUTFILE [START_EPOCH]
+#
+# START_EPOCH overrides the detected service start. Needed where systemd cannot
+# answer -- a container, a sysvinit host -- and where the answer must be
+# deterministic, as in the test suite.
 open_window() {
-    local file=$1 unit=$2 out=$3 start
+    local file=$1 unit=$2 out=$3 start=${4:-}
     [ -n "$KRK_TMP" ] || { printf 'unscoped'; return; }
     : >"$out"
     if [ ! -e "$file" ]; then printf 'missing'; return; fi
     if [ ! -r "$file" ]; then printf 'unreadable'; return; fi
-    start=$(krk_service_start_epoch "$unit" 2>/dev/null) || start=""
+    case $start in ''|*[!0-9]*) start=$(krk_service_start_epoch "$unit" 2>/dev/null) || start="" ;; esac
     if [ -z "$start" ]; then
         cat "$file" >"$out" 2>/dev/null
         printf 'unscoped'
@@ -133,16 +138,31 @@ open_window() {
     printf '%s' "$start"
 }
 
-_w=$(open_window "$KRK_XRDP_LOG" xrdp "$XRDP_WINDOW")
+_w=$(open_window "$KRK_XRDP_LOG" xrdp "$XRDP_WINDOW" "${KRK_XRDP_START_EPOCH:-}")
 case $_w in
     missing|unreadable|unscoped) XRDP_WINDOW_STATE=$_w ;;
     *) XRDP_WINDOW_STATE=ok; XRDP_START=$_w ;;
 esac
-_w=$(open_window "$KRK_SESMAN_LOG" xrdp-sesman "$SESMAN_WINDOW")
+_w=$(open_window "$KRK_SESMAN_LOG" xrdp-sesman "$SESMAN_WINDOW" "${KRK_SESMAN_START_EPOCH:-}")
 case $_w in
     missing|unreadable|unscoped) SESMAN_WINDOW_STATE=$_w ;;
     *) SESMAN_WINDOW_STATE=ok ;;
 esac
+
+# Log evidence only justifies a hard failure when the window is actually dated
+# to the running service. On a host where the start time cannot be established
+# the window is the whole file, and asserting that an error in it is happening
+# *now* is exactly the false alarm this release set out to remove -- so it is
+# downgraded to a warning that says why it cannot be certain.
+# The caller passes the claim without any time qualifier; this adds the one
+# the evidence actually supports.
+log_fail() {
+    if [ "$XRDP_WINDOW_STATE" = ok ]; then
+        fail "$* since xrdp started"
+    else
+        flag "$* somewhere in $KRK_XRDP_LOG, undated -- it may already be resolved"
+    fi
+}
 
 # win_count WINDOW PATTERN -- occurrences inside a window, 0 when unusable.
 # grep exits 1 on no match, so the count has to be taken from its output alone.
@@ -315,7 +335,7 @@ else
     case $readable in
         0)
             if [ "$key_errors" -gt 0 ]; then
-                fail "$runtime_user can read the key now, but the running xrdp logged $key_errors key-read failure(s) since it started"
+                log_fail "$runtime_user can read the key now, but xrdp logged $key_errors key-read failure(s)"
                 fix "sudo systemctl restart xrdp   # the running process predates the permission fix"
             else
                 pass "$runtime_user can read the TLS key"
@@ -332,7 +352,7 @@ else
             # Cannot impersonate runtime_user without root. Fall back to the
             # evidence that is available, and say which one was used.
             if [ "$key_errors" -gt 0 ]; then
-                fail "xrdp logged $key_errors key-read failure(s) since it started -- TLS handshakes are failing"
+                log_fail "TLS handshakes are failing: $key_errors key-read failure(s)"
                 fix "sudo kali-rdp-setup   # adds $runtime_user to the key's group"
             elif [ -n "$key_group" ] && ! id -nG "$runtime_user" 2>/dev/null | tr ' ' '\n' | grep -qx "$key_group"; then
                 fail "$runtime_user is not in group '$key_group' -- cannot read $real_key"
@@ -727,7 +747,7 @@ sesman_refused=$(win_count "$XRDP_WINDOW" 'sesman connect .* failed|Error connec
 
 if [ "$handshake_fail" -gt 0 ]; then
     if [ "$logins_ok" -eq 0 ]; then
-        fail "$handshake_fail handshake failure(s) and NO successful login since xrdp started -- nothing can connect"
+        log_fail "nothing can connect: $handshake_fail handshake failure(s) and NO successful login"
         [ "${sec_layer:-negotiate}" = negotiate ] && \
             fix "sudo kali-rdp-setup --security-layer tls   # negotiation against a self-signed cert is the usual cause"
         fix "sudo journalctl -u xrdp -n 50"
@@ -745,7 +765,7 @@ elif [ "$XRDP_WINDOW_STATE" = ok ] || [ "$XRDP_WINDOW_STATE" = unscoped ]; then
 fi
 
 if [ "$sesman_refused" -gt 0 ]; then
-    fail "$sesman_refused failed connection(s) from xrdp to sesman -- the login box will accept a password and then hang"
+    log_fail "the login box will accept a password and then hang: $sesman_refused failed connection(s) from xrdp to sesman"
     fix "sudo systemctl restart xrdp-sesman && kali-rdp-doctor"
 fi
 
