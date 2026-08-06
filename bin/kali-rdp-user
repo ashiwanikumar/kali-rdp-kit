@@ -17,6 +17,10 @@ PROFILE="openbox"
 SHELL_PATH=""
 NO_SUDO=1
 SSH_KEY=""
+WITH_DEV_TOOLS=0
+
+KRK_DEV_PACKAGES="${KRK_DEV_PACKAGES:-git curl ripgrep build-essential}"
+KRK_CLAUDE_INSTALLER="${KRK_CLAUDE_INSTALLER:-https://claude.ai/install.sh}"
 
 usage() {
     cat <<'EOF'
@@ -32,14 +36,95 @@ Options for `add`:
       --shell PATH     login shell (default: the system default)
       --sudo           also add the user to the sudo group
       --ssh-key FILE   install FILE as the user's authorized_keys
+      --with-dev-tools install node (system-wide), git/ripgrep/build-essential,
+                       and Claude Code for this user
   -n, --dry-run        print what would change, change nothing
   -h, --help           this message
 
 Examples:
   sudo kali-rdp-user add alice
   sudo kali-rdp-user add bob --profile xfce --sudo
+  sudo kali-rdp-user add alice --with-dev-tools   # safe to re-run on an
+                                                  # existing user
   sudo kali-rdp-user list
 EOF
+}
+
+# Debian's ~/.profile adds ~/.local/bin at login only. RDP sessions and
+# non-login shells bypass it, so a freshly installed Claude Code is on disk but
+# not on PATH -- which reads as "the install failed".
+ensure_local_bin_path() {
+    local name=$1 home=$2 rc marker='# >>> kali-rdp-kit PATH >>>'
+    for rc in "$home/.bashrc" "$home/.zshrc"; do
+        [ -f "$rc" ] || continue
+        grep -qF "$marker" "$rc" 2>/dev/null && continue
+        if [ "$KRK_DRY_RUN" = 1 ]; then
+            printf '%s  would add%s ~/.local/bin to PATH in %s\n' \
+                "$C_DIM" "$C_RESET" "$rc"
+            continue
+        fi
+        backup_file "$rc"
+        cat >>"$rc" <<EOF
+
+$marker
+# Claude Code and other per-user tools install here.
+case ":\$PATH:" in
+    *":\$HOME/.local/bin:"*) ;;
+    *) PATH="\$HOME/.local/bin:\$PATH" ;;
+esac
+# <<< kali-rdp-kit PATH <<<
+EOF
+        chown "$name:$(id -gn "$name")" "$rc"
+        info "added ~/.local/bin to PATH in $(basename "$rc")"
+    done
+}
+
+install_dev_tools() {
+    local name=$1 home=$2 missing="" pkg
+
+    krk_ensure_node
+
+    for pkg in $KRK_DEV_PACKAGES; do
+        dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" \
+            || missing="$missing $pkg"
+    done
+    if [ -n "$missing" ]; then
+        info "installing dev packages:$missing"
+        # shellcheck disable=SC2086
+        run env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $missing \
+            || warn "some dev packages failed to install; continuing"
+    else
+        ok "dev packages already present"
+    fi
+
+    ensure_local_bin_path "$name" "$home"
+
+    if [ -x "$home/.local/bin/claude" ]; then
+        ok "Claude Code already installed for $name"
+        return 0
+    fi
+    if [ "$KRK_DRY_RUN" = 1 ]; then
+        printf '%s  would install%s Claude Code for %s from %s\n' \
+            "$C_DIM" "$C_RESET" "$name" "$KRK_CLAUDE_INSTALLER"
+        return 0
+    fi
+
+    # Installed per user rather than once system-wide on purpose: Claude Code
+    # updates itself in place under ~/.local/share/claude, so it needs a
+    # directory the user can write to. A single shared copy would either fail
+    # to update or let one user's upgrade change every other user's version.
+    info "installing Claude Code for $name"
+    if runuser -l "$name" -c "curl -fsSL '$KRK_CLAUDE_INSTALLER' | bash"; then
+        if [ -x "$home/.local/bin/claude" ]; then
+            ok "Claude Code installed: $("$home/.local/bin/claude" --version 2>/dev/null | head -1)"
+        else
+            warn "installer reported success but $home/.local/bin/claude is missing"
+        fi
+    else
+        warn "Claude Code install failed for $name -- the account is otherwise ready"
+        warn "retry with: runuser -l $name -c 'curl -fsSL $KRK_CLAUDE_INSTALLER | bash'"
+        return 1
+    fi
 }
 
 # xrdp's sesman consults TerminalServerUsers from sesman.ini when
@@ -74,8 +159,16 @@ cmd_add() {
         # shellcheck disable=SC2086
         run useradd $args "$name" || die "useradd failed"
         if [ "$KRK_DRY_RUN" != 1 ]; then
-            warn "no password set for $name -- set one now (RDP needs it):"
-            passwd "$name" || warn "passwd failed; run 'passwd $name' before they log in"
+            # Only prompt when there is a terminal to prompt on. Calling passwd
+            # unconditionally wedges any non-interactive caller -- a provisioning
+            # script, cloud-init, CI -- on a prompt nobody can answer.
+            if [ -t 0 ]; then
+                warn "no password set for $name -- set one now (RDP needs it):"
+                passwd "$name" || warn "passwd failed; run 'passwd $name' before they log in"
+            else
+                warn "no password set for $name and no terminal to prompt on"
+                warn "RDP authentication will fail until you run: passwd $name"
+            fi
         fi
     fi
 
@@ -103,6 +196,9 @@ cmd_add() {
     fi
 
     local home; home=$(getent passwd "$name" | cut -d: -f6)
+    # In a dry run the account was never created, so there is no home to read.
+    # Assume the default so the remaining steps can still be previewed.
+    [ -z "$home" ] && [ "$KRK_DRY_RUN" = 1 ] && home="/home/$name"
 
     if [ -n "$SSH_KEY" ]; then
         [ -f "$SSH_KEY" ] || die "no such key file: $SSH_KEY"
@@ -117,7 +213,11 @@ cmd_add() {
     fi
 
     info "applying desktop profile: $PROFILE"
-    if have kali-rdp-profile; then
+    if [ "$KRK_DRY_RUN" = 1 ] && ! id "$name" >/dev/null 2>&1; then
+        # kali-rdp-profile resolves the account itself, so it cannot preview a
+        # user that this dry run only pretended to create.
+        printf '%s  would apply%s profile %s to %s\n' "$C_DIM" "$C_RESET" "$PROFILE" "$name"
+    elif have kali-rdp-profile; then
         local pf_args="set $PROFILE --user $name"
         [ "$KRK_DRY_RUN" = 1 ] && pf_args="$pf_args --dry-run"
         # shellcheck disable=SC2086
@@ -126,9 +226,16 @@ cmd_add() {
         warn "kali-rdp-profile not found; skipping desktop setup"
     fi
 
+    if [ "$WITH_DEV_TOOLS" = 1 ]; then
+        step "Development tools"
+        install_dev_tools "$name" "$home" || true
+    fi
+
     echo
     info "$name is ready for RDP"
     log "  connect to port $(ini_get "$KRK_XRDP_DIR/xrdp.ini" Globals port) as $name"
+    [ "$WITH_DEV_TOOLS" = 1 ] && \
+        log "  ${C_DIM}node and Claude Code are on PATH after their next login${C_RESET}"
 }
 
 cmd_list() {
@@ -199,6 +306,7 @@ while [ $# -gt 0 ]; do
         --shell)      SHELL_PATH=${2:?--shell needs a value}; shift ;;
         --sudo)       NO_SUDO=0 ;;
         --ssh-key)    SSH_KEY=${2:?--ssh-key needs a value}; shift ;;
+        --with-dev-tools) WITH_DEV_TOOLS=1 ;;
         -n|--dry-run) KRK_DRY_RUN=1 ;;
         -h|--help)    usage; exit 0 ;;
         -*)           err "unknown option: $1"; usage >&2; exit 2 ;;

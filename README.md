@@ -118,12 +118,27 @@ a startup sequence that can time out. `xfce` is marked known-issue — see below
 ```bash
 sudo kali-rdp-user add alice --profile openbox
 sudo kali-rdp-user add bob --profile xfce --sudo --ssh-key ~/bob.pub
+sudo kali-rdp-user add alice --with-dev-tools        # node + Claude Code
 kali-rdp-user list
 ```
 
 Creates the account, adds it to the terminal-server group *if* your `sesman.ini`
 actually enforces one (it reads `AlwaysGroupCheck` and `TerminalServerUsers`
 rather than assuming), installs the tmux config, and applies a desktop profile.
+
+`--with-dev-tools` additionally installs **node system-wide** (`/usr/bin/node`,
+from Kali's own archive) plus `git`, `ripgrep`, and `build-essential`, then
+installs **Claude Code** for that user and puts `~/.local/bin` on their `PATH`.
+
+Node goes system-wide deliberately: an `nvm` install lives in one user's home
+and is invisible to every account created afterwards — which is how a new user
+ends up with a working desktop and no runtime. Claude Code goes per-user just as
+deliberately: it self-updates in place under `~/.local/share/claude`, so a single
+shared copy would either fail to update or let one user's upgrade silently change
+everyone else's version.
+
+The flag is idempotent — re-run it on an existing user to add the toolchain
+without touching anything else.
 
 ### `kali-ssh-setup` — connection survival
 

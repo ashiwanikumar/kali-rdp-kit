@@ -6,7 +6,7 @@ Architecture: all
 Maintainer: Ashiwani Kumar <ashvanikumar109@gmail.com>
 Depends: bash (>= 5.0), xrdp, tigervnc-standalone-server, procps, iproute2
 Recommends: tmux, openssh-server
-Suggests: openbox, i3, fail2ban, mosh
+Suggests: openbox, i3, fail2ban, mosh, nodejs, npm, git, ripgrep
 Homepage: https://github.com/ashiwanikumar/kali-rdp-kit
 Description: Reliable headless RDP setup for Kali Linux
  Configures and repairs xrdp on Kali, where the usual Xorg backend cannot be

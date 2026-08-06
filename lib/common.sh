@@ -166,6 +166,48 @@ krk_xorgxrdp_usable() {
     dpkg-query -W -f='${Status}' xorgxrdp 2>/dev/null | grep -q "install ok installed"
 }
 
+# Node must be system-wide, not per-user. A node installed via nvm lives under
+# one user's home and is invisible to every account created afterwards -- which
+# is exactly how a freshly provisioned user ends up with a working desktop and
+# no runtime at all.
+KRK_NODE_MIN_MAJOR="${KRK_NODE_MIN_MAJOR:-20}"
+
+krk_node_major() {
+    local v
+    v=$(node --version 2>/dev/null) || return 1
+    v=${v#v}
+    printf '%s' "${v%%.*}"
+}
+
+krk_ensure_node() {
+    local major path
+    major=$(krk_node_major) || major=""
+    path=$(command -v node 2>/dev/null || true)
+
+    if [ -n "$major" ] && [ "$major" -ge "$KRK_NODE_MIN_MAJOR" ] 2>/dev/null; then
+        case $path in
+            /usr/bin/*|/usr/local/bin/*)
+                ok "node $major available system-wide ($path)"
+                return 0 ;;
+            *)
+                # Satisfies the version check for whoever is running this, and
+                # nobody else. Install the system copy anyway.
+                warn "node $major found at $path -- per-user only, installing system-wide too" ;;
+        esac
+    fi
+
+    info "installing nodejs and npm system-wide"
+    run env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    run env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs npm \
+        || die "could not install nodejs (needed for Claude Code)"
+
+    if [ "${KRK_DRY_RUN:-0}" != 1 ]; then
+        major=$(krk_node_major) || major=""
+        [ -n "$major" ] && [ "$major" -ge "$KRK_NODE_MIN_MAJOR" ] 2>/dev/null \
+            || warn "installed node reports version '${major:-unknown}', wanted >= $KRK_NODE_MIN_MAJOR"
+    fi
+}
+
 krk_init_state() {
     KRK_RUN_ID="$(date +%Y%m%d-%H%M%S)"
     export KRK_RUN_ID
