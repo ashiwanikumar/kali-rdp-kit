@@ -22,6 +22,11 @@ kali-rdp-doctor                 # verify
 Installing changes nothing about your xrdp configuration. `kali-rdp-setup` is a
 separate, explicit step, and `--dry-run` prints every change first.
 
+> **Picking this up cold?** [`STATUS.md`](STATUS.md) has the current state of
+> the work, the design rules that must not be broken, what is verified against a
+> live system and what is only inferred, and how to test without root or a
+> working xrdp. [`CHANGELOG.md`](CHANGELOG.md) has the itemised history.
+
 ## The tools
 
 | Command | What it does |

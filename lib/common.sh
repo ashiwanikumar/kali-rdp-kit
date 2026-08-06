@@ -158,7 +158,9 @@ krk_xvnc_sessions() {
 # the client disconnects the socket closes but Xvnc lingers -- that is exactly
 # the orphan we want to reap, and why uptime is the wrong signal.
 krk_display_connected() {
-    local port=$(( 5900 + $1 ))
+    # 10# forces base ten: bash reads a leading zero as octal, so a display
+    # written ":08" would otherwise be an arithmetic error rather than 8.
+    local port=$(( 5900 + 10#$1 ))
     if have ss; then
         ss -tnH state established "( sport = :$port or dport = :$port )" 2>/dev/null \
             | grep -q . && return 0
@@ -264,7 +266,6 @@ krk_xvnc_inventory() {
             p[n] = pid; pp[n] = ppid; d[n] = disp
             rec[n] = pid "\t" disp "\t" (depth == "" ? "?" : depth) "\t" \
                      (geom == "" ? "?" : geom) "\t" kind
-            ischild[ppid] = 1
         }
         END {
             # An Xvnc that daemonises is briefly visible twice: the launcher and
@@ -401,7 +402,14 @@ krk_cert_days_left() {
     end=${end#notAfter=}
     end=$(date -d "$end" +%s 2>/dev/null) || return 1
     now=$(date +%s)
-    printf '%s' $(( (end - now) / 86400 ))
+    # Integer division truncates toward zero, so a certificate that expired an
+    # hour ago would come back as 0 and be reported as "expires in 0 days"
+    # rather than as expired. Round away from zero on the negative side.
+    if [ "$end" -le "$now" ]; then
+        printf '%s' "-$(( (now - end + 86399) / 86400 ))"
+    else
+        printf '%s' $(( (end - now) / 86400 ))
+    fi
 }
 
 # krk_can_read_as USER FILE -> 0 readable, 1 not readable, 2 could not test.

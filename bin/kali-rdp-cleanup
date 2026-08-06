@@ -126,7 +126,17 @@ seen_clear() {
 # Kill a process group politely, then firmly.
 reap() {
     local pid=$1 what=$2
-    kill -0 "$pid" 2>/dev/null || return 0
+    if ! kill -0 "$pid" 2>/dev/null; then
+        # kill(2) reports "no such process" and "not permitted" with the same
+        # shell exit status. /proc tells them apart, and the difference matters:
+        # reporting "done" to a user who lacks the privilege to kill anything
+        # is a plain lie about what happened.
+        if [ -d "/proc/$pid" ]; then
+            err "cannot signal $what (pid $pid) -- it belongs to another user; re-run with sudo"
+            return 1
+        fi
+        return 0
+    fi
     if [ "$KRK_DRY_RUN" = 1 ]; then
         printf '%s  would reap%s %s (pid %s)\n' "$C_DIM" "$C_RESET" "$what" "$pid"
         return 0
@@ -149,7 +159,7 @@ reap_session() {
         [ "$(disp_num "$(krk_proc_env "$spid" DISPLAY)")" = "$display" ] \
             && reap "$spid" "helper for :$display"
     done
-    reap "$pid" "Xvnc :$display"
+    reap "$pid" "Xvnc :$display" || { seen_clear "$display"; return 1; }
     seen_clear "$display"
 }
 
@@ -161,8 +171,8 @@ if [ -n "$KILL_DISPLAY" ]; then
     if [ -z "$target" ]; then
         die "no Xvnc is running on display :$KILL_DISPLAY"
     fi
-    kpid=$(printf '%s' "$target" | cut -f1)
-    kkind=$(printf '%s' "$target" | cut -f5)
+    kpid=$(printf '%s' "$target" | head -1 | cut -f1)
+    kkind=$(printf '%s' "$target" | head -1 | cut -f5)
     kowner=$(krk_pid_user "$kpid")
     if [ "$kkind" != sesman ]; then
         warn ":$KILL_DISPLAY is a standalone Xvnc (started by hand, not by xrdp)"
@@ -180,13 +190,18 @@ if [ -n "$KILL_DISPLAY" ]; then
             fi
         fi
     fi
-    reap_session "$KILL_DISPLAY" "$kpid"
+    reap_session "$KILL_DISPLAY" "$kpid" || true
     echo
     if [ "$KRK_DRY_RUN" = 1 ]; then
         info "dry run -- nothing was killed"
-    else
-        info "done"
+        exit 0
     fi
+    # Confirm rather than assume: the reap may have been refused, and a caller
+    # scripting this needs a status it can trust.
+    if [ -d "/proc/$kpid" ]; then
+        die ":$KILL_DISPLAY is still running (pid $kpid)"
+    fi
+    info "done"
     exit 0
 fi
 
@@ -210,7 +225,7 @@ while IFS=$'\t' read -r pid display _depth _geom kind; do
             reap_session "$display" "$pid"
             reaped=$(( reaped + 1 ))
         else
-            warn ":$display -- untracked by sesman: no client can rejoin it (holding port $(( 5900 + display )))"
+            warn ":$display -- untracked by sesman: no client can rejoin it (holding port $(( 5900 + 10#display )))"
             warn "            reap it with: kali-rdp-cleanup --orphans"
             live_displays="$live_displays $display"
         fi

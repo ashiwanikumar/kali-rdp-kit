@@ -160,6 +160,10 @@ contains "the surviving child is the one kept" "$out" "2002"
 out=$(PATH="$TMP/bin:$PATH" FAKE_PS="$TMP/ps.normal" krk_xvnc_sessions)
 check "krk_xvnc_sessions shares the inventory's view" "$out" "$(printf '1001 22\n1002 5')"
 
+# A display written with a leading zero must not be read as octal.
+check "display :08 resolves to port 5908, not an arithmetic error" \
+    "$( (krk_display_connected 08; echo "rc=$?") 2>&1 | grep -c 'value too great\|invalid' )" "0"
+
 # ---------------------------------------------------------------------------
 section "orphan detection (a desktop sesman has forgotten)"
 
@@ -236,6 +240,19 @@ if command -v openssl >/dev/null 2>&1; then
         else
             FAIL=$(( FAIL + 1 )); printf '  %sFAIL%s expired certificate reported %s days\n' "$red" "$rst" "$days"
         fi
+    fi
+    # Integer division truncates toward zero, so a certificate that went out of
+    # date an hour ago must not come back as "0 days left" and be reported as
+    # merely expiring soon.
+    openssl req -x509 -newkey rsa:2048 -keyout "$TMP/j.key" -out "$TMP/j.pem" \
+        -nodes -subj "/CN=just-expired" \
+        -not_before "$(date -u -d '2 days ago'  +%Y%m%d%H%M%SZ)" \
+        -not_after  "$(date -u -d '1 hour ago'  +%Y%m%d%H%M%SZ)" >/dev/null 2>&1
+    if [ -s "$TMP/j.pem" ]; then
+        days=$(krk_cert_days_left "$TMP/j.pem")
+        check "expired an hour ago reads as -1 day, not 0" "$days" "-1"
+    else
+        echo "  skip: this openssl cannot backdate a certificate"
     fi
 else
     echo "  skip: no openssl"

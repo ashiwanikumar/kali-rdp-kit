@@ -738,6 +738,10 @@ if [ "$handshake_fail" -gt 0 ]; then
     fi
 elif [ "$logins_ok" -gt 0 ]; then
     pass "$logins_ok successful login(s) and no handshake failures since xrdp started"
+elif [ "$XRDP_WINDOW_STATE" = ok ] || [ "$XRDP_WINDOW_STATE" = unscoped ]; then
+    # Nobody has connected yet. Saying so beats an empty section, which reads
+    # like the check did not run.
+    pass "no connection errors since xrdp started (and no logins yet)"
 fi
 
 if [ "$sesman_refused" -gt 0 ]; then
@@ -745,10 +749,16 @@ if [ "$sesman_refused" -gt 0 ]; then
     fix "sudo systemctl restart xrdp-sesman && kali-rdp-doctor"
 fi
 
-if [ "$auth_fail" -gt 0 ]; then
+# One rejected login is a typo. A run of them is either somebody locked out or
+# somebody knocking, and only then is it worth an admin's attention -- warning
+# on a single mistyped password is the same crying-wolf failure as everything
+# else this section exists to avoid.
+if [ "$auth_fail" -ge 5 ]; then
     port=$(ini_get "$XRDP_INI" Globals port)
     flag "$auth_fail rejected login attempt(s) since xrdp started"
     fix "if this host's port ${port:-3389} is reachable from the internet, put it behind a VPN or SSH tunnel"
+elif [ "$auth_fail" -gt 0 ]; then
+    note "$auth_fail rejected login attempt(s) since xrdp started"
 fi
 
 [ "$early_close" -gt 0 ] && \

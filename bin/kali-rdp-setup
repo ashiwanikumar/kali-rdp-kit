@@ -562,17 +562,29 @@ if [ "$KRK_DRY_RUN" != 1 ] && [ "$CHANGED" -gt 0 ] && [ "$NO_RESTART" != 1 ]; th
     fi
     listen_port=$(ini_get "$XRDP_INI" Globals port)
     listen_port=${listen_port:-3389}
-    # The listener can take a moment to bind after the unit reports active.
-    for _ in 1 2 3 4 5; do
-        ss -tlnH 2>/dev/null | grep -q ":$listen_port " && break
-        sleep 1
-    done
-    if ss -tlnH 2>/dev/null | grep -q ":$listen_port "; then
-        ok "xrdp is listening on port $listen_port"
+    # xrdp.ini also accepts forms like "tcp://:3389" and "vsock://...", and a
+    # host may not have iproute2 at all. Failing the whole run because the
+    # *verification* could not be performed would be a false alarm about a
+    # server that is fine, so an unverifiable listener is a note, not an error.
+    case $listen_port in
+        *[!0-9]*) note_port="" ;;
+        *)        note_port=$listen_port ;;
+    esac
+    if [ -z "$note_port" ] || ! have ss; then
+        warn "could not verify the listener (port '$listen_port'); xrdp itself is running"
     else
-        err "xrdp is running but nothing is listening on port $listen_port"
-        log "  sudo journalctl -u xrdp -n 50 --no-pager"
-        exit 1
+        # The listener can take a moment to bind after the unit reports active.
+        for _ in 1 2 3 4 5; do
+            ss -tlnH 2>/dev/null | grep -q ":$note_port " && break
+            sleep 1
+        done
+        if ss -tlnH 2>/dev/null | grep -q ":$note_port "; then
+            ok "xrdp is listening on port $note_port"
+        else
+            err "xrdp is running but nothing is listening on port $note_port"
+            log "  sudo journalctl -u xrdp -n 50 --no-pager"
+            exit 1
+        fi
     fi
 fi
 

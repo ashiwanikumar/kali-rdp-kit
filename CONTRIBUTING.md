@@ -2,7 +2,7 @@
 
 ## Ground rules for these scripts
 
-This tool runs as root, edits system config, and kills processes. Three rules
+This tool runs as root, edits system config, and kills processes. These rules
 follow from that, and patches that break them will not be merged:
 
 1. **Every mutating action goes through `run`.** That is what makes `--dry-run`
@@ -12,9 +12,21 @@ follow from that, and patches that break them will not be merged:
    session is actually in use. Killing a session someone is working in is the
    worst thing this tool can do, and it is exactly what the naive
    implementation does.
+4. **Never report history as news.** Any check that reads a log goes through
+   `krk_log_since`, or one of the doctor's pre-built windows. A bare grep over
+   `/var/log/xrdp.log` reports problems that were fixed weeks ago as if they
+   were happening now, and a tool that cries wolf gets ignored when it is right.
+5. **"Could not test" is not "failed".** Where a probe can be inconclusive, say
+   so and fall back — see `krk_can_read_as`, which returns three distinct
+   answers for exactly this reason. Collapsing them made the tool refuse to
+   apply its own fix.
 
-For anything touching sshd, add the fourth rule: validate with `sshd -t` before
-the config can take effect, and `reload` rather than `restart`.
+For anything touching sshd, add: validate with `sshd -t` before the config can
+take effect, and `reload` rather than `restart`.
+
+[`STATUS.md`](STATUS.md) carries the rest of the load-bearing design decisions,
+plus what is verified against a live system and what is only inferred. Read it
+before changing session or log handling.
 
 ## Development
 
@@ -33,11 +45,18 @@ sudo dpkg -i dist/kali-rdp-kit_*.deb
 Before opening a PR:
 
 ```bash
-shellcheck --severity=warning bin/* lib/common.sh install.sh packaging/build-deb.sh
+./tests/run-tests.sh
+shellcheck --severity=warning bin/* lib/common.sh tests/run-tests.sh \
+    install.sh packaging/build-deb.sh
 for f in bin/* lib/common.sh; do bash -n "$f"; done
 ```
 
-CI runs both, plus a package build and a smoke test.
+CI runs all three, plus a package build and a smoke test.
+
+`tests/run-tests.sh` needs neither root nor a working xrdp: it drives the
+helpers with log fixtures, a fake `ps` on `PATH`, and overridden lineage
+functions. **Add a case for every bug you fix** — every check in there exists
+because something was once reported as broken.
 
 ## Versioning
 
