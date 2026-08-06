@@ -5,7 +5,7 @@ contributor, or yourself in three months. `README.md` says what the tools do;
 this file says where the work stands, what is known to be true, what is only
 believed, and what a change must not break.
 
-Last updated: 2026-08-06, at the end of the v0.5.0 work.
+Last updated: 2026-08-06, just after v0.5.0 was released.
 
 ---
 
@@ -14,10 +14,15 @@ Last updated: 2026-08-06, at the end of the v0.5.0 work.
 | | |
 |---|---|
 | Version | 0.5.0 (`KRK_VERSION` in `lib/common.sh` is the single source of truth) |
-| Branch | `v0.5.0-reconnect-fixes`, merged to `main` |
-| Tests | `./tests/run-tests.sh` — 51 checks, all passing, no root or xrdp needed |
+| Released | tag `v0.5.0`, GitHub release published with the .deb attached |
+| Branch | `main`; the work branch was merged fast-forward and deleted |
+| Tests | `./tests/run-tests.sh` — 58 checks, all passing, no root or xrdp needed |
 | Lint | shellcheck clean at `--severity=warning` across every script |
-| Package | `./packaging/build-deb.sh` → `dist/kali-rdp-kit_0.5.0_all.deb` |
+| Package | `./packaging/build-deb.sh` → `dist/kali-rdp-kit_0.5.0_all.deb`, byte-reproducible |
+| Installed | 0.5.0 is installed on this host and its binaries match the tag |
+
+`main` has moved past the tag: the build-reproducibility fix landed after
+v0.5.0 was cut, so it belongs to the next release.
 
 Nothing is half-finished. The open items below are all "would be nice", not
 "left broken".
@@ -133,9 +138,14 @@ Small, none blocking:
 - Depth `?` (an `Xvnc` with no `-depth` in argv) would be treated as a distinct
   colour depth by the multi-depth warning. Not reachable via sesman, which
   always passes `-depth`.
-- `MaxSessions=50` is the only warning left on this host.
 - The doctor's `--watch` re-execs itself; each iteration builds fresh log
   windows. Fine at a 5s interval on this host, but it is O(log size) per tick.
+- The v0.5.0 release asset predates the reproducibility fix, so rebuilding at
+  that tag gives a different checksum (timestamps only; contents were verified
+  identical). Re-pointing the tag would refresh it — the release workflow is
+  idempotent — but nothing is wrong with the published package.
+- The Xfce ~25s session exit is still the project's biggest gap and predates all
+  of this: `docs/xfce-25s.md` describes a workaround, not a diagnosis.
 
 ## Working on it
 
