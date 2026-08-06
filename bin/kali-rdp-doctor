@@ -666,9 +666,26 @@ while IFS=$'\t' read -r _p _d _dep _g _k; do
 done <<<"$inventory"
 
 locker_any=0
+locker_checked=""
+locker_skipped=""
+_me=$(id -un)
 for _u in $locker_users; do
     _home=$(getent passwd "$_u" | cut -d: -f6)
     [ -n "$_home" ] || continue
+
+    # Only root can read inside another account's home. Looking anyway turns a
+    # permission error into "found no override", which is a warning about a
+    # locker that is in fact disabled. Whose home can be read is decided by who
+    # is asking -- not by probing, because an unreadable directory and an
+    # absent one are indistinguishable from outside, and they mean opposite
+    # things: absent means there is genuinely no override and the locker really
+    # will start, which is a finding rather than a gap.
+    if [ "$(id -u)" -ne 0 ] && [ "$_u" != "$_me" ]; then
+        locker_skipped="$locker_skipped$_u "
+        continue
+    fi
+    locker_checked="$locker_checked$_u "
+
     locker_autostart=""
     for _lk in $KRK_LOCKERS; do
         [ -f "/etc/xdg/autostart/$_lk.desktop" ] || continue
@@ -676,13 +693,6 @@ for _u in $locker_users; do
         if [ -f "$_home/.config/autostart/$_lk.desktop" ] \
            && grep -q '^Hidden=true' "$_home/.config/autostart/$_lk.desktop" 2>/dev/null; then
             continue
-        fi
-        # A home this process cannot read tells us nothing either way, and
-        # guessing "not disabled" from a permission error is how the check
-        # earns a reputation for lying.
-        if [ ! -r "$_home/.config" ] && [ "$(id -u)" -ne 0 ]; then
-            note "cannot read $_u's autostart config; skipped"
-            continue 2
         fi
         locker_autostart="$locker_autostart$_lk "
     done
@@ -692,7 +702,13 @@ for _u in $locker_users; do
         locker_any=1
     fi
 done
-[ "$locker_any" -eq 0 ] && pass "no screen locker will autostart (checked: ${locker_users% })"
+if [ "$locker_any" -eq 0 ] && [ -n "$locker_checked" ]; then
+    pass "no screen locker will autostart (checked: ${locker_checked% })"
+fi
+# Naming the accounts that were not looked at keeps the pass above honest about
+# its own scope.
+[ -n "$locker_skipped" ] && \
+    note "not checked without root: ${locker_skipped% }"
 
 step "9. Orphaned helper processes"
 

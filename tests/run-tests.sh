@@ -404,6 +404,24 @@ check "the locker verdict does not change with \$HOME" \
 contains "and it names the account it actually checked" \
     "$(locker_section HOME="$TMP/no-such-home")" "checked: "
 
+# An account whose home this process cannot read must be reported as not
+# checked, never folded into the list it claims to have checked. Any real
+# account other than the current one is unreadable to an unprivileged run.
+if [ "$(id -u)" -ne 0 ]; then
+    other=""
+    for cand in nobody daemon bin; do
+        [ "$cand" != "$(id -un)" ] && getent passwd "$cand" >/dev/null 2>&1 && { other=$cand; break; }
+    done
+    if [ -n "$other" ]; then
+        out=$(locker_section SUDO_USER="$other")
+        contains "an unreadable account is named as not checked" \
+            "$out" "not checked without root: $other"
+        lacks "and is not counted among the checked ones" "$out" "checked: $other"
+    else
+        echo "  skip: no second account to test with"
+    fi
+fi
+
 # An unreadable log must be reported as unreadable, never as "all clear".
 if [ "$(id -u)" -ne 0 ]; then
     printf 'x\n' >"$TMP/secret.log"; chmod 000 "$TMP/secret.log"

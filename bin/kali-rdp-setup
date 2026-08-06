@@ -522,6 +522,11 @@ else
         warn "they keep running and their applications are not killed, but no client"
         warn "can rejoin them afterwards -- reconnecting will build a new empty desktop"
         warn "log out of them first, or re-run with --no-restart to apply this later"
+        # Without this the dry run prints "would run: systemctl restart", which
+        # reads as a promise to restart unconditionally -- when a real run would
+        # stop and ask, and would decline outright with no terminal to ask on.
+        [ "$KRK_DRY_RUN" = 1 ] && [ "$ASSUME_YES" != 1 ] && \
+            info "a real run would ask before restarting, and decline if there were no terminal to ask on"
     fi
 
     if [ "${n_live:-0}" -gt 0 ] && [ "$KRK_DRY_RUN" != 1 ]; then
