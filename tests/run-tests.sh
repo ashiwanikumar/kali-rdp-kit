@@ -308,10 +308,13 @@ section "doctor end to end"
 
 DOC="$ROOT/bin/kali-rdp-doctor"
 mkdir -p "$TMP/xrdp"
+# runtime_user is `nobody`, not `xrdp`: a machine without xrdp installed has no
+# xrdp account, and the doctor rightly stops at "that user does not exist"
+# before it ever reaches the log checks these cases are about.
 cat >"$TMP/xrdp/xrdp.ini" <<'EOF'
 [Globals]
 port=3389
-runtime_user=xrdp
+runtime_user=nobody
 security_layer=negotiate
 crypt_level=high
 ssl_protocols=TLSv1.2, TLSv1.3
